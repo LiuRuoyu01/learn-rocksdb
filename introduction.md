@@ -1,11 +1,6 @@
-# learn-rocksdb
-
 由于工作需要，便开始学习RocksDB源码，并记录自己的学习过程。在学习过程中发现网上较少有关于对RocksDB的教程，所以将学习文档分享出来供大家参考
 
-## 目录
 
-- [前言]()
-- [1. 简介](./ch01/RocksDB_Introduction.md)
 
 ## 说明
 
