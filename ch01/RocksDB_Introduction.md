@@ -24,30 +24,33 @@ RocksDB 是一个高性能、嵌入式的键值存储引擎，基于 LevelDB 进
 
 ## 编译
 
-```c++
+```
 git clone https://github.com/facebook/rocksdb.git
 git checkout v9.9.3
-注释掉makefile文件的下面语句（-Werror会要求gcc将所有warning当初error处理，导致编译不通过） 
-#    WARNING_FLAGS += -Werror 
-单独编译和安装方式选下面一种即可，PREFIX指定安装的位置，默认是/usr/local 
-动态库    
-make shared_lib    
-make install-shared PREFIX=/usr/local/rocksdb 
-静态库  
-make static_lib    
-make install-static PREFIX=/usr/local/rocksdb 
-基于cmake集成到项目编译：   
-rocksdb可以作为一个子项目去编译，在主目录添加自定义编译目标
-add_custom_target(build-rocksdb          
-		COMMAND make -j4 shared_lib -C ${ROCKSDB_SOURCE_DIR}         
-    COMMENT "Building RocksDB"    
-) 
-编译单元测试：   
-如编译db_iter_test.cc，就执行    
-make db_iter_test -j4 
-编译ldb：   
-进入rocksdb目录   
-make ldb  //默认编译debug版本    
-DEBUG_LEVEL=0   make ldb  //编译release版本
-```
+//安装rocksdb常用库支持
+sudo apt install libzstd-dev libbz2-dev liblz4-dev libsnappy-dev zlib1g-dev			 		
 
+//可查看官方示例 , 展示了如何使用 RocksDB 的 API 实现基础功能和一些高级特性。这些示例代码对于学习 RocksDB 的用法、测试其性能以及快速构建原型非常有帮助。
+make shared_lib 
+cd examples
+make all
+
+//RocksDB提供了一个命令行工具 ldb，用于操作 RocksDB 数据库文件，例如查询、调试和验证数据
+//使用cmake编译ldb
+mkdir -p build
+cd build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+make ldb
+cd tools
+
+//在build/tools目录下查看ldb是否编译成功
+./ldb --version
+  
+//基于cmake集成到项目编译：   
+//rocksdb可以作为一个子项目去编译，在主目录添加自定义编译目标
+add_custom_target(build-rocksdb          
+		COMMAND make -j4 shared_lib -C ${ROCKSDB_SOURCE_DIR}
+                  COMMENT "Building RocksDB"    
+) 
+ 
+```
