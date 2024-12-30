@@ -4,8 +4,9 @@
 
 ## 目录
 
-- [前言]()
+- [前言](https://github.com/LiuRuoyu01/learn-rocksdb/blob/main/introduction.md)
 - [1. 简介](./ch01/RocksDB_Introduction.md)
+- [2. 组成部分](./ch02/RocksDB_Files.md)
 
 ## 说明
 
