@@ -55,6 +55,11 @@ total 228K
 
 **RocksDB通过减少布隆过滤器的误判率进行性能调优**
 
+SST Boomfilter 在Flush生成SST files时通过计算产生，分为两个阶段
+
+1. 将prefix_extrator指定的key前缀加入到HASH表hash_entries_中
+2. 将hash_entries_所有映射到Bloom filter的数组中
+
 ```c++
 //创建布隆过滤器
 //bits_per_key即一个key占用多少个bit

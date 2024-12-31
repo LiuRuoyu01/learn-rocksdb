@@ -8,6 +8,10 @@ RocksDB 是一个高性能、嵌入式的键值存储引擎，基于 LevelDB 进
 
 <img src="./images/rocksdb基本架构图.png" alt="RocksDB_introduction" style="zoom:150%;" />
 
+### 流程介绍
+
+rocksdb通过wal的方式将随机写转变为顺序写，先将数据写入到内存中的memtable中，当memtable被写满时转变为只可读的immemtable，等待flush流程进行刷盘操作。之后在内存中开始写入新的memtable。immemtable进行flush之后生成SST文件保存在磁盘中，磁盘中数据存放的数据结构是LSM树，由于L0是内存刷盘而保存的文件，所以L0层的数据不严格排序，从L1层开始所有SST文件的key严格排序（例如在L2层的第一个SST文件是key0 - key99，第二个SST文件key100 - key200）。SST文件会进行定期的compaction操作，会将数据进行整合处理并保存在层级更高的地方，compaction之后的数据也是有序的。
+
 ## RocksDB的优缺点
 
 ### 优点
