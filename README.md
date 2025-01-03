@@ -6,7 +6,8 @@
 
 - [前言](https://github.com/LiuRuoyu01/learn-rocksdb/blob/main/introduction.md)
 - [1. 简介](./ch01/RocksDB_Introduction.md)
-- [2. 组成部分](./ch02/RocksDB_Files.md)
+- [2. 内存文件](./ch02/RocksDB_Files.md)
+- [3. SST文件](./ch03/RocksDB_SST.md)
 
 ## 说明
 
