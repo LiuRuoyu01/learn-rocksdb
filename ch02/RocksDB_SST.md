@@ -18,18 +18,18 @@ cat 000008_dump.txt
  
 Footer Details:
 --------------------------------------  
-checksum: 1                 			//校验和  
-metaindex handle: D10736   				//索引Metaindex Details  
-index handle: 9F3A16         				//索引Index 
-Details  footer version: 6        //版本  
-table_magic_number: 9863518390377041911  //固定值，验证文件是否为合法的 SST 文件  
+checksum: 1                                //校验和  
+metaindex handle: D10736                   //索引Metaindex Details  
+index handle: 9F3A16                       //索引Index 
+Details  footer version: 6                 //版本  
+table_magic_number: 9863518390377041911    //固定值，验证文件是否为合法的 SST 文件  
   
 //元数据
 Metaindex Details:
 --------------------------------------  
 Filter block handle: C30345            // 索引布隆过滤器数据块  
 Properties block handle: F204C805      // 索引Table Properties  属性
-Range deletion block handle: AF043E    // 索引Range deletions		范围删除
+Range deletion block handle: AF043E    // 索引Range deletions   范围删除
 
 Table Properties:
 --------------------------------------  
@@ -59,7 +59,7 @@ creation time: 0                                     // 最先写入memtable的�
 time stamp of earliest key: 0                        //   
 file creation time: 0                                // sst文件创建时间  
 
-//索引块
+// 索引块
 Index Details:    
 --------------------------------------  
 Block key hex dump: Data block handle  
@@ -68,7 +68,7 @@ HEX    6B65795F626239: 00BE03
 ASCII  k e y _ b b 9   
 ------
 
-//范围删除数据
+// 范围删除数据
 Range deletions: 
 --------------------------------------    
 HEX    6B65795F626232: 6B65795F626235  
@@ -400,9 +400,9 @@ Slice Finish(std::unique_ptr<const char[]>* buf, Status* status) override {
   }
 
   // 在位数组末尾添加元数据
-  mutable_buf[len] = static_cast<char>(-1);								// 标识格式
+  mutable_buf[len] = static_cast<char>(-1);               // 标识格式
   mutable_buf[len + 1] = static_cast<char>(0);            // 标识子实现
-  mutable_buf[len + 2] = static_cast<char>(num_probes);		// 标识探测次数
+  mutable_buf[len + 2] = static_cast<char>(num_probes);	  // 标识探测次数
 
   // ...
   
