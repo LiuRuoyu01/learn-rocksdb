@@ -6,6 +6,8 @@ RocksDB的写请求写入到MemTable后就认为是写成功了，MemTable存放
 
 <img src="./images/memtable.png" alt="memtable" style="zoom:200%;" />
 
+除了默认的 memtable 实现，用户还可以使用其他类型的 memtable 实现，例如 HashLinkList、HashSkipList 或者 Vector，来加速某些查询。
+
 ```c++
 //存入MemTable的kv数据格式
 |-internal_key_size-|---key---|--seq--type|--value_size--|--value--|
