@@ -82,7 +82,7 @@ WAL 文件被[重用](./RocksDB_WAL.md#I/O数量)时，他会被逻辑上记为�
 
    追踪过时的方式
 
-   1. **追踪 WAL 的过时事件：通过在 MANIFEST 中记录 WAL 的过时事件，确保 WAL 的生命周期（包括创建、关闭、过时）都被跟踪，可以准确地知道哪些 WAL 文件仍然存活，哪些已经过时。MANIFEST 中与 WAL 相关的 VersionEdits 可以作为哪些 WAL 处于活动状态的真实来源。
+   1. **追踪 WAL 的过时事件**：通过在 MANIFEST 中记录 WAL 的过时事件，确保 WAL 的生命周期（包括创建、关闭、过时）都被跟踪，可以准确地知道哪些 WAL 文件仍然存活，哪些已经过时。MANIFEST 中与 WAL 相关的 VersionEdits 可以作为哪些 WAL 处于活动状态的真实来源。
    2. **通过** min_log_number **确定 WAL 是否过时**：通过持久化空列族的最新日志编号，从而确保 min_log_number 是准确的，并能确保 WAL 的过时状态
       - 由于不同列族共享 WAL 日志，如果有 N 个这样的列族，那么每次创建新的 WAL 时，我们都需要向 MANIFEST 写入 N 个 VersionEdits，以将当前日志编号记录为空列族的 min_log_number。（比如列族1很久没有更新，列族2一直在更新，并且不断产生新的 WAL 文件。对于列族1，它长时间没有进行任何更新，所以列族1的 log_number 可能会被错误地认为是较小的，导致恢复时认为某些不再需要的 WAL 文件依然是有效的。为了确保其 log_number 不会被忽略，因此它的 log_number 会被设置为**最大值**，通常是一个非常大的数字，并且这个信息没有持久化到 MANIFEST 文件中，RocksDB 会在 MANIFEST 中**写入一个空的 VersionEdit**，表示列族1的最新 log_number）
 
