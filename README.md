@@ -5,20 +5,17 @@
 ## 目录
 
 - [前言](https://github.com/LiuRuoyu01/learn-rocksdb/blob/main/introduction.md)
-
 - [1. 简介](./ch01/RocksDB_Introduction.md)
-
 - [2. 主要文件介绍](./ch02)
-
   - [2.1. 文件概览](./ch02/RocksDB_Files.md)
-
   - [2.2. WAL](./ch02/RocksDB_WAL.md)
-
   - [2.3. MemTable](/ch02/RocksDB_MemTable.md)
-
   - [2.4. Manifest](/ch02/RocksDB_Manifest.md)
-
   - [2.5. SST](/ch02/RocksDB_SST.md)
+- [3. 主要功能块介绍](./ch03)
+  - [3.1. 布隆过滤器](./ch03/RocksDB_BloomFilter.md)
+  - [3.2. 块缓存](./ch03/RocksDB_Cache.md)
+
 
 ## 说明
 
