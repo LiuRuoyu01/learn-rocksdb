@@ -252,14 +252,102 @@ void LRUCacheShard::EvictFromLRU(size_t charge,
 ##### 插入策略
 
 - **避免覆盖**：
-  - 插入时不会覆盖已有 Entries ，而是寻找空槽插入。
+  - 插入时不会覆盖已有 Entries 。
+    - 覆盖旧 Entries 会存在读写冲突（在修改 Entries 时仍有线程在读取该条目），锁竞争等
   - 旧 Entries 在不被使用时通过逐出机制移除。
-
 - **Standalone Entries**：
   - 当缓存容量已满时，新 Entries 会作为 Standalone Entries 分配在堆上。
   - Standalone Entries 不会被后续查找命中，但可以正常使用，直到其引用计数归零。
 
 ```c++
+Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
+                              typename Table::HandleImpl** handle,
+                              Cache::Priority priority, size_t capacity,
+                              uint32_t eec_and_scl) {
+  
+  if (eec_and_scl & kStrictCapacityLimitBit) {
+    // kStrictCapacityLimitBit 情况下，如果内存满且移除条目失败会返回错误状态
+    Status s = ChargeUsageMaybeEvictStrict<Table>(
+        total_charge, capacity, need_evict_for_occupancy, eec_and_scl, state);
+    if (!s.ok()) {
+      occupancy_.FetchSubRelaxed(1);
+      return s;
+    }
+  } else {
+    bool success = ChargeUsageMaybeEvictNonStrict<Table>(
+        total_charge, capacity, need_evict_for_occupancy, eec_and_scl, state);
+    if (!success) {
+      occupancy_.FetchSubRelaxed(1);
+      if (handle == nullptr) {
+        // 非 kStrictCapacityLimitBit 情况下，内存满且移除条目失败
+        // 如果 handle 为空，默认条目已被插入并立即驱逐
+        proto.FreeData(allocator_);
+        return Status::OK();
+      } else {
+        // 需要通过独立插入 standalone_insert
+        usage_.FetchAddRelaxed(total_charge);
+        use_standalone_insert = true;
+      }
+    }
+  }
+
+  if (!use_standalone_insert) {
+    // 使用标准插入，如果找到相同条目则放弃插入
+    HandleImpl* e =
+        derived.DoInsert(proto, initial_countdown, handle != nullptr, state);
+    if (e) {
+      if (handle) {
+        *handle = e;
+      }
+      return Status::OK();
+    }
+    // 插入失败会进行回退操作
+    occupancy_.FetchSubRelaxed(1);
+    if (handle == nullptr) {
+      // 如果 handle 为空，默认该条目已经被插入但被立即驱逐
+      usage_.FetchSubRelaxed(total_charge);
+      assert(usage_.LoadRelaxed() < SIZE_MAX / 2);
+      proto.FreeData(allocator_);
+      return Status::OK();
+    }
+		// 执行独立插入
+    use_standalone_insert = true;
+  }
+  *handle = StandaloneInsert<HandleImpl>(proto);
+  return Status::OkOverwritten();
+}
+
+HandleImpl* BaseClockTable::StandaloneInsert(
+    const ClockHandleBasicData& proto) {
+  // 分配在堆上，处理具体数据和元数据
+  HandleImpl* h = new HandleImpl();
+  ClockHandleBasicData* h_alias = h;
+  *h_alias = proto;
+  // Standalone Entries 指的是那些没有成功插入到主表中的条目
+  // 通常这些条目会被单独管理，不会参与主表的替换
+  h->SetStandalone();
+  // 设置状态为 Invisible，不会被后续查找命中
+  uint64_t meta = uint64_t{ClockHandle::kStateInvisible}
+                  << ClockHandle::kStateShift;
+  meta |= uint64_t{1} << ClockHandle::kAcquireCounterShift;
+  h->meta.Store(meta);
+  return h;
+}
+
+```
+
+```c++
+/*
+low bits                                                     high bits
+----------------------------------------------------------------------
+| acquire counter      | release counter     | hit bit | state marker |
+----------------------------------------------------------------------
+acquire counter:  每次条目被 Lookup() 或其他类似操作获取时，该计数器会增加
+release counter:  这个计数器表示条目被释放的次数。每次引用结束时，release counter 会递增,过比较 acquire counter 和 release counter,当两者相等时，条目处于未被引用的状态，表明它可以被考虑驱逐
+hit bit:          通常用来标记某个缓存条目是否近期有被访问
+state marker:     标记条目的状态
+*/
+
 // 固定大小的缓存表，支持高效的查找，适合静态容量管理。
 // 采用开放寻址法，在发生哈希冲突时，使用一个次级哈希函数来计算步长，所有条目存储在哈希表本身
 // 哈希表中的条目插入后位置是固定的，不能因后续插入或删除操作而移动
@@ -284,38 +372,30 @@ FixedHyperClockTable::HandleImpl* FixedHyperClockTable::DoInsert(
   HandleImpl* e = FindSlot(
       proto.hashed_key,
       [&](HandleImpl* h) {
+        // 尝试讲条目插入到当前的槽中，如果存在会更新 already_matches
         return TryInsert(proto, *h, initial_countdown, keep_ref,
                          &already_matches);
       },
       [&](HandleImpl* h) {
         if (already_matches) {
-          // Stop searching & roll back displacements
+          // 如果条目已经存在当前槽中则需要回滚
           Rollback(proto.hashed_key, h);
           return true;
         } else {
-          // Keep going
           return false;
         }
       },
       [&](HandleImpl* h, bool is_last) {
         if (is_last) {
-          // Search is ending. Roll back displacements
+          // 撤销之前对 displacements 的修改
           Rollback(proto.hashed_key, h);
         } else {
+          // 记录状态变化
           h->displacements.FetchAddRelaxed(1);
         }
       });
-  if (already_matches) {
-    // Insertion skipped
-    return nullptr;
-  }
-  if (e != nullptr) {
-    // Successfully inserted
-    return e;
-  }
-  
-  assert(GetTableSize() < 256);
-  return nullptr;
+ 
+  //...
 }
 
 FixedHyperClockTable::HandleImpl* FixedHyperClockTable::Lookup(
@@ -343,7 +423,7 @@ FixedHyperClockTable::HandleImpl* FixedHyperClockTable::Lookup(
           if (h->hashed_key == hashed_key) {
             if (eviction_callback_) {
               // 如果存在缓存移除机制（CLOCK）
-              // 命中需更新命中位
+              // 需更新命中位
               h->meta.FetchOrRelaxed(uint64_t{1} << ClockHandle::kHitBitShift);
             }
             return true;
@@ -367,32 +447,24 @@ FixedHyperClockTable::HandleImpl* FixedHyperClockTable::Lookup(
 }
 
 // 释放缓存条目
+// erase_if_last_ref:   如果当前条目是最后一个引用且需要删除时，可以进行删除操作
+// 相比于 LRU，当缓存超出容量且引用是最后一个时，不会删除 handle，
+// 空间仅由 EvictFromClock 和 Erase 释放
 bool FixedHyperClockTable::Release(HandleImpl* h, bool useful,
                                    bool erase_if_last_ref) {
-  // 相比于 LRU，当缓存超出容量且引用是最后一个时，不会删除 handle，
-  // 空间仅由 EvictFromClock 和 Erase 释放，为了避免对 usage_ 进行额外的原子读取
-
   uint64_t old_meta;
   if (useful) {
     // 标记当前条目已经被成功使用，可以释放该引用
-    // kReleaseIncrement 标识被释放的总次数
     old_meta = h->meta.FetchAdd(ClockHandle::kReleaseIncrement);
   } else {
     // 撤销之前错误或无效的引用操作，恢复条目的引用状态
-    // kAcquireIncrement 表示被引用的总次数
     old_meta = h->meta.FetchSub(ClockHandle::kAcquireIncrement);
   }
 
   // 确保状态为 Shareable
   assert((old_meta >> ClockHandle::kStateShift) &
          ClockHandle::kStateShareableBit);
-  // 确保引用计数不下溢出
-  assert(((old_meta >> ClockHandle::kAcquireCounterShift) &
-          ClockHandle::kCounterMask) !=
-         ((old_meta >> ClockHandle::kReleaseCounterShift) &
-          ClockHandle::kCounterMask));
 
-  // 检查是否可以移除
   if (erase_if_last_ref || UNLIKELY(old_meta >> ClockHandle::kStateShift ==
                                     ClockHandle::kStateInvisible)) {
     // 更新引用计数
@@ -419,8 +491,8 @@ bool FixedHyperClockTable::Release(HandleImpl* h, bool useful,
   
     size_t total_charge = h->GetTotalCharge();
     if (UNLIKELY(h->IsStandalone())) {
-      h->FreeData(allocator_);
       // 释放 standalone handle
+      h->FreeData(allocator_);
       delete h;
       standalone_usage_.FetchSubRelaxed(total_charge);
       usage_.FetchSubRelaxed(total_charge);
@@ -437,6 +509,54 @@ bool FixedHyperClockTable::Release(HandleImpl* h, bool useful,
   }
 }
 
-
+void FixedHyperClockTable::Erase(const UniqueId64x2& hashed_key) {
+  (void)FindSlot(
+      hashed_key,
+      [&](HandleImpl* h) {
+        // 获取 Acquire 计数器
+        uint64_t old_meta = h->meta.FetchAdd(ClockHandle::kAcquireIncrement);
+        if ((old_meta >> ClockHandle::kStateShift) ==
+            ClockHandle::kStateVisible) {
+          if (h->hashed_key == hashed_key) {
+            // 更改状态为 Invisible，以便后续查找不可见
+            old_meta =
+                h->meta.FetchAnd(~(uint64_t{ClockHandle::kStateVisibleBit}
+                                   << ClockHandle::kStateShift));
+            old_meta &= ~(uint64_t{ClockHandle::kStateVisibleBit}
+                          << ClockHandle::kStateShift);
+            for (;;) {
+              uint64_t refcount = GetRefcount(old_meta);
+              if (refcount > 1) {
+                // 该条目在删除过程中还有其他引用，因此不删除它，撤销对该条目的引用
+                Unref(*h);
+                break;
+              } else if (h->meta.CasWeak(
+                             old_meta, uint64_t{ClockHandle::kStateConstruction}
+                                           << ClockHandle::kStateShift)) {
+                // 通过 CAS 将状态改为 Construction，表示该条目正在被删除中
+                size_t total_charge = h->GetTotalCharge();
+                FreeDataMarkEmpty(*h, allocator_);
+                ReclaimEntryUsage(total_charge);
+                Rollback(hashed_key, h);
+                break;
+              }
+            }
+          } else {
+            // 不匹配，则撤销对条目的引用
+            Unref(*h);
+          }
+        } else if (UNLIKELY((old_meta >> ClockHandle::kStateShift) ==
+                            ClockHandle::kStateInvisible)) {
+          // 如果条目的状态是 Invisible，表示该条目已经被删除，直接撤销引用
+          Unref(*h);
+        } else {
+          // 其他状态下，条目不再被查找或引用，不会改变条目的可用性或引用计数
+        }
+        return false;
+      },
+      // displacements 用于判断该条目是否在操作过程中被干扰，是否可以安全地进行删除或其他操作
+      [&](HandleImpl* h) { return h->displacements.LoadRelaxed() == 0; },
+      [&](HandleImpl* /*h*/, bool /*is_last*/) {});
+}
 ```
 
