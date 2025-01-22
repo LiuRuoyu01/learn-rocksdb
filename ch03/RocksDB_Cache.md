@@ -9,7 +9,7 @@ Block Cache 是 RocksDB 用于 **读操作** 的内存缓存，存储了从 SST 
 - 哈希表：根据键（Key）和哈希值直接定位 Entries 在缓存中的位置，同时还记录 Entries 的位置（例如指向 LRU 链表节点的指针）。哈希表**仅负责查找和存储，不记录 Entries 使用的时间或顺序。**
 - LRUCache：记录 Entries 的使用顺序，**动态更新 Entries 顺序**（每当 Entries 被访问时，从链表中移除该 Entries ，等 Realse 之后重新插入到 LRU 中）。通过节点链接，维护 Entries 之间的关系，实际的数据存储和快速定位由哈希表负责
 
-启用 **cache_index_and_filter_blocks_with_high_priority （高优先级）**后，Block Cache 的 LRU 列表会被分为两部分：
+启用 **cache_index_and_filter_blocks_with_high_priority （高优先级）** 后，Block Cache 的 LRU 列表会被分为两部分：
 
 - **高优先级池（High-pri Pool）**：存储索引块、过滤器块和压缩字典块。
 
@@ -19,7 +19,7 @@ Block Cache 是 RocksDB 用于 **读操作** 的内存缓存，存储了从 SST 
 
 启用 **pin_l0_filter_and_index_blocks_in_cache** 后，将 **Level-0 层（L0 层）** 文件的索引块和过滤器块固定（pin）到 **Block Cache** 中，防止它们被逐出。L0 层中的文件通常是最新生成的文件，存储了最新的已刷盘数据，这些文件的数据块被读取的概率较高
 
-启用 **pin_top_level_index_and_filter** 后，将分区索引和过滤器的 **顶层结构（存储了各个分区的元信息，用于快速定位分区内的数据块或过滤器） ** 固定到 Block Cache 中
+启用 **pin_top_level_index_and_filter** 后，将分区索引和过滤器的 **顶层结构（存储了各个分区的元信息，用于快速定位分区内的数据块或过滤器）** 固定到 Block Cache 中
 
 ```c++
 // 分片缓存的单个分片
@@ -310,7 +310,7 @@ Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
       proto.FreeData(allocator_);
       return Status::OK();
     }
-		// 执行独立插入
+    // 执行独立插入
     use_standalone_insert = true;
   }
   *handle = StandaloneInsert<HandleImpl>(proto);

@@ -33,7 +33,7 @@ min_log_number_to_keep 0    //2PC模式下使用，恢复过程中忽略小于�
 
 ##### MANIFEST日志文件生成流程
 
-1. MANIFEST日志文件会将RocksDB 的**状态变化（如 SST 文件的创建、删除、合并等操作）**记录下来。
+1. MANIFEST日志文件会将RocksDB 的**状态变化（如 SST 文件的创建、删除、合并等操作）** 记录下来。
 
 2. 当MANIFEST日志文件大小超过一定阀值时，RocksDB会创建一个新的MANIFEST日志文件，新的MANIFEST日志文件只会记录当前的**数据库状态（例如 SST 文件列表、层级信息、键范围等）快照**，更新 CURRENT 文件，使其指向新的 MANIFEST 文件。
 
