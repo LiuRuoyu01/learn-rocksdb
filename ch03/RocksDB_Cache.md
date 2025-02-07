@@ -6,8 +6,8 @@ Block Cache 是 RocksDB 用于 **读操作** 的内存缓存，存储了从 SST 
 
 ### LRUCache
 
-- 哈希表：根据键（Key）和哈希值直接定位 Entries 在缓存中的位置，同时还记录 Entries 的位置（例如指向 LRU 链表节点的指针）。哈希表**仅负责查找和存储，不记录 Entries 使用的时间或顺序。**
-- LRUCache：记录 Entries 的使用顺序，**动态更新 Entries 顺序**（每当 Entries 被访问时，从链表中移除该 Entries ，等 Realse 之后重新插入到 LRU 中）。通过节点链接，维护 Entries 之间的关系，实际的数据存储和快速定位由哈希表负责
+- 哈希表：根据键（Key）和哈希值直接定位 Entries 在缓存中的位置，同时还记录 Entries 的位置（例如指向 LRU 链表节点的指针）。哈希表**仅负责查找和存储，不记录 Entries 使用的时间或顺序**。通过单链表来解决 hash 冲突，每次针对 hash 表的链表插入都会采用头插法，保证越新的 key 越靠近 bucket 头部
+- LRUCache：双链表，记录 Entries 的使用顺序，**动态更新 Entries 顺序（每当 Entries 被访问时，从链表中移除该 Entries ，等 Realse 之后重新插入到 LRU 中）** 。通过节点链接，维护 Entries 之间的关系，实际的数据存储和快速定位由哈希表负责
 
 启用 **cache_index_and_filter_blocks_with_high_priority （高优先级）** 后，Block Cache 的 LRU 列表会被分为两部分：
 
@@ -71,7 +71,7 @@ Status LRUCacheShard::InsertItem(LRUHandle* e, LRUHandle** handle) {
 
   {
     DMutexLock l(mutex_);
-    // 按照严格的 LRU 策略逐出条目
+    // 按照严格的 LRU 策略逐出旧数据，保证 e 有足够空间存储
     EvictFromLRU(e->total_charge, &last_reference_list);
     // 判断插入条目后是否超过缓存容量
     if ((usage_ + e->total_charge) > capacity_ &&
