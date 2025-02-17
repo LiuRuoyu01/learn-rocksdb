@@ -1,15 +1,16 @@
 ## MANIFEST文件
 
-MANIFEST日志文件是元数据文件，描述了所有列族中__LSM树结构信息__的文件，包含 RocksDB 的**状态快照**（每一层sst文件概要信息）和**状态变更记录**，可以通过MANIFEST观察当前LSM树的结构
+MANIFEST 日志文件是元数据文件，描述了所有列族中 __LSM 树结构信息__的文件，包含 RocksDB 的**状态快照**（每一层sst文件概要信息）和**状态变更记录**，可以通过 MANIFEST 观察当前 LSM 树的结构
 
-CURRENT文件是一个特殊的指针文件，始终指向最新的MANIFEST日志文件
+CURRENT 文件是一个特殊的指针文件，始终指向最新的 MANIFEST 日志文件
 
 系统（重新）启动时，RocksDB 通过 CURRENT 文件找到最新的 MANIFEST 文件，读取最新的 MANIFEST 文件，加载 RocksDB 的元信息，如果有未完成的状态变更（例如由于系统崩溃导致的未完成操作），通过回放 MANIFEST 中的变更日志恢复数据库的一致性
 
 ``` 
 ./ldb manifest_dump --path="my_rocksdb/MANIFEST-000032"
-// 仅包含 RocksDB 的当前状态快照 
-// 打印如下：
+
+仅包含 RocksDB 的当前状态快照 
+打印如下：
 --------------- Column family "default"  (ID 0) --------------   
 log number: 10                            //正在使用WAL文件的编号
 comparator: leveldb.BytewiseComparator    //RocksDB默认比较器，按照字符大小比较键值
@@ -33,15 +34,15 @@ min_log_number_to_keep 0    //2PC模式下使用，恢复过程中忽略小于�
 
 ##### MANIFEST日志文件生成流程
 
-1. MANIFEST日志文件会将RocksDB 的**状态变化（如 SST 文件的创建、删除、合并等操作）** 记录下来。
+1. MANIFEST 日志文件会将 RocksDB 的**状态变化（如 SST 文件的创建、删除、合并等操作）** 记录下来。
 
-2. 当MANIFEST日志文件大小超过一定阀值时，RocksDB会创建一个新的MANIFEST日志文件，新的MANIFEST日志文件只会记录当前的**数据库状态（例如 SST 文件列表、层级信息、键范围等）快照**，更新 CURRENT 文件，使其指向新的 MANIFEST 文件。
+2. 当 MANIFEST 日志文件大小超过一定阀值时，RocksDB 会创建一个新的 MANIFEST 日志文件，新的 MANIFEST 日志文件只会记录当前的**数据库状态（例如 SST 文件列表、层级信息、键范围等）快照**，更新 CURRENT 文件，使其指向新的 MANIFEST 文件。
 
-3. 之后RocksDB 会删除冗余的旧 MANIFEST 文件，释放存储空间。
+3. 之后 RocksDB 会删除冗余的旧 MANIFEST 文件，释放存储空间。
 
 ##### MANIFEST记录SST文件的动态信息（状态变化）
 
-- MANIFEST 文件是追加写日志文件，采用记录条目（log entry）的形式，每次 SST 文件的变更会以新记录的形式追加到 MANIFEST 中
+- MANIFEST 文件是追加写日志文件，采用 **log entry** 的形式，每次 SST 文件的变更会以新记录的形式追加到 MANIFEST 中
 
 ### 问题
 
@@ -68,7 +69,7 @@ min_log_number_to_keep 0    //2PC模式下使用，恢复过程中忽略小于�
 
 ##### MANIFEST 跟踪WAL 生命周期
 
-WAL 文件被[重用](./RocksDB_WAL.md#I/O数量)时，他会被逻辑上记为删除，因此也会在 MANIFEST 文件记录一个删除事件（和非重用文件流程完全相同）
+WAL 文件被[重用](https://github.com/LiuRuoyu01/learn-rocksdb/blob/main/ch02/RocksDB_WAL.md#io%E6%95%B0%E9%87%8F)时，他会被逻辑上记为删除，因此也会在 MANIFEST 文件记录一个删除事件（和非重用文件流程完全相同）
 
 1. WAL 创建时：将日志编号写入 MANIFEST，以指示已创建新的 WAL。
 
@@ -84,7 +85,7 @@ WAL 文件被[重用](./RocksDB_WAL.md#I/O数量)时，他会被逻辑上记为�
 
    1. **追踪 WAL 的过时事件**：通过在 MANIFEST 中记录 WAL 的过时事件，确保 WAL 的生命周期（包括创建、关闭、过时）都被跟踪，可以准确地知道哪些 WAL 文件仍然存活，哪些已经过时。MANIFEST 中与 WAL 相关的 VersionEdits 可以作为哪些 WAL 处于活动状态的真实来源。
    2. **通过** min_log_number **确定 WAL 是否过时**：通过持久化空列族的最新日志编号，从而确保 min_log_number 是准确的，并能确保 WAL 的过时状态
-      - 由于不同列族共享 WAL 日志，如果有 N 个这样的列族，那么每次创建新的 WAL 时，我们都需要向 MANIFEST 写入 N 个 VersionEdits，以将当前日志编号记录为空列族的 min_log_number。（比如列族1很久没有更新，列族2一直在更新，并且不断产生新的 WAL 文件。对于列族1，它长时间没有进行任何更新，所以列族1的 log_number 可能会被错误地认为是较小的，导致恢复时认为某些不再需要的 WAL 文件依然是有效的。为了确保其 log_number 不会被忽略，因此它的 log_number 会被设置为**最大值**，通常是一个非常大的数字，并且这个信息没有持久化到 MANIFEST 文件中，RocksDB 会在 MANIFEST 中**写入一个空的 VersionEdit**，表示列族1的最新 log_number）
+      - 由于不同列族共享 WAL 日志，如果有 N 个这样的列族，那么每次创建新的 WAL 时，我们都需要向 MANIFEST 写入 N 个 VersionEdits，以将当前日志编号记录为空列族的 min_log_number。（比如列族 1 很久没有更新，列族 2 一直在更新，并且不断产生新的 WAL 文件。对于列族 1，它长时间没有进行任何更新，所以列族 1 的 log_number 可能会被错误地认为是较小的，导致恢复时认为某些不再需要的 WAL 文件依然是有效的。为了确保其 log_number 不会被忽略，因此它的 log_number 会被设置为**最大值**，通常是一个非常大的数字，并且这个信息没有持久化到 MANIFEST 文件中，RocksDB 会在 MANIFEST 中**写入一个空的 VersionEdit**，表示列族 1 的最新 log_number）
 
    追踪过时的时间：
 
@@ -97,17 +98,91 @@ WAL 文件被[重用](./RocksDB_WAL.md#I/O数量)时，他会被逻辑上记为�
 
 ##### WAL 相关设计
 
-- 采用了WalAddition 和 WalDeletion，其中WalAddition：表示 WAL 文件的创建和写入完成；WalDeletion：表示 WAL 文件的删除。
+- 采用了WalAddition 和 WalDeletion，其中
+  - WalAddition：表示 WAL 文件的创建和写入完成；
+
+  - WalDeletion：表示 WAL 文件的删除。
 
 - 每个 VersionEdit 要么是 WalAddition，要么是 WalDeletion，不能同时包含两者
-- LogAndApply 中对 WAL 相关 VersionEdit 的特殊处理 ：在 VersionSet 中维护一个独立的数据结构，用于跟踪存活的 WAL 文件，次 WAL 文件的变更都通过 WalAddition 和 WalDeletion 更新这个独立数据结构，而不是创建新的列族版本
+- LogAndApply 中对 WAL 相关 VersionEdit 的特殊处理 ：在 VersionSet 中维护一个独立的数据结构，用于跟踪存活的 WAL 文件，每次 WAL 文件的变更都通过 WalAddition 和 WalDeletion 更新这个独立数据结构，而不是创建新的列族版本
 
 ```c++
-// writers:                      包含所有待处理的 ManifestWriter。
-// mu:                           数据库锁，保证线程安全。
-// dir_contains_current_file:    表示包含当前文件的目录。
-// new_descriptor_log:           指示是否需要切换到新的 MANIFEST 文件。
-// new_cf_options:               针对新列族的配置选项。
+// column_family_datas：           需要进行操作的所有列族。
+// mutable_cf_options_list：       每个列族对应的可变列族选项。
+// read_options 和 write_options： 用于指定读取和写入操作的选项
+// edit_lists：                    包含了对多个列族的一系列修改
+// mu：                            互斥锁
+// dir_contains_current_file：     当前 MANIFEST 文件是否包含在指定目录中的指针
+// new_descriptor_log：            指示是否需要切换到新的 MANIFEST 文件。
+// new_cf_options：                针对新的列族选项。
+// manifest_wcbs：                 回调函数列表
+Status VersionSet::LogAndApply(
+    const autovector<ColumnFamilyData*>& column_family_datas,
+    const autovector<const MutableCFOptions*>& mutable_cf_options_list,
+    const ReadOptions& read_options, const WriteOptions& write_options,
+    const autovector<autovector<VersionEdit*>>& edit_lists,
+    InstrumentedMutex* mu, FSDirectory* dir_contains_current_file,
+    bool new_descriptor_log, const ColumnFamilyOptions* new_cf_options,
+    const std::vector<std::function<void(const Status&)>>& manifest_wcbs) {
+  mu->AssertHeld();
+  // 计算所有的操作数量
+  int num_edits = 0;
+  for (const auto& elist : edit_lists) {
+    num_edits += static_cast<int>(elist.size());
+  }
+
+  // 针对每个列族创建 ManifestWriter
+  int num_cfds = static_cast<int>(column_family_datas.size());
+  std::deque<ManifestWriter> writers;
+  for (int i = 0; i < num_cfds; ++i) {
+    const auto wcb =
+        manifest_wcbs.empty() ? [](const Status&) {} : manifest_wcbs[i];
+    // ManifestWriter 分别加入到局部队列和全局队列
+    writers.emplace_back(mu, column_family_datas[i],
+                         *mutable_cf_options_list[i], edit_lists[i], wcb);
+    manifest_writers_.push_back(&writers[i]);
+  }
+  
+  // 保证顺序执行
+  // 只有当之前保存在全局队列中的所有 Writers 都写入完毕之后才会执行此次局部队列，否则就会等待 
+  ManifestWriter& first_writer = writers.front();
+  while (!first_writer.done && &first_writer != manifest_writers_.front()) {
+    first_writer.cv.Wait();
+  }
+  if (first_writer.done) {
+    return first_writer.status;
+  }
+
+  // 统计没有被删除的列族数量
+  int num_undropped_cfds = 0;
+  for (auto cfd : column_family_datas) {
+    if (cfd == nullptr || !cfd->IsDropped()) {
+      ++num_undropped_cfds;
+    }
+  }
+  
+  // 如果所有列族都被删除，则所有的写操作都会被丢弃
+  if (0 == num_undropped_cfds) {
+    for (int i = 0; i != num_cfds; ++i) {
+      manifest_writers_.pop_front();
+    }
+    if (!manifest_writers_.empty()) {
+      manifest_writers_.front()->cv.Signal();
+    }
+    return Status::ColumnFamilyDropped();
+  }
+  
+  return ProcessManifestWrites(writers, mu, dir_contains_current_file,
+                               new_descriptor_log, new_cf_options, read_options,
+                               write_options);
+}
+
+
+// writers:                       包含所有待处理的 ManifestWriter。
+// mu:                            数据库锁，保证线程安全。
+// dir_contains_current_file:     表示包含当前文件的目录。
+// new_descriptor_log:            指示是否需要切换到新的 MANIFEST 文件。
+// new_cf_options:                针对新列族的配置选项。
 // read_options 和 write_options: 读写操作的配置参数。
 Status VersionSet::ProcessManifestWrites(
     std::deque<ManifestWriter>& writers, InstrumentedMutex* mu,
@@ -115,29 +190,59 @@ Status VersionSet::ProcessManifestWrites(
     const ColumnFamilyOptions* new_cf_options, const ReadOptions& read_options,
     const WriteOptions& write_options) {
   
-  // 取出writers 队列中的第一个 ManifestWriter 作为当前的写操作
+  // 取出 writers 队列中的第一个 ManifestWriter 作为当前的写操作
   ManifestWriter& first_writer = writers.front();
   ManifestWriter* last_writer = &first_writer;
 
   // ...
 
   if (first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
-    // 如果操作是列族的添加或删除，直接调用 LogAndApplyCFHelper，不进行批量处理
+    // 如果操作是列族的添加或删除结构变化，直接调用 LogAndApplyCFHelper
     LogAndApplyCFHelper(first_writer.edit_list.front(), &max_last_sequence);
     batch_edits.push_back(first_writer.edit_list.front());
     batch_edits_ts_sz.push_back(std::nullopt);
   } else {
-    // manifest_writers_是一个包含多个写操作的队列，每个写操作可能包含一组 VersionEdit
     auto it = manifest_writers_.cbegin();
     // 记录组的起始位置，写操作时是事务，只能全成功或全失败
     size_t group_start = std::numeric_limits<size_t>::max();
     while (it != manifest_writers_.cend()) {
-      // 列族需要单独处理，不能与非列族混合处理..
+      // 列族的添加或删除结构变化需要单独处理
+      if ((*it)->edit_list.front()->IsColumnFamilyManipulation()) {
+        break;
+      }
       
       // 获取当前的 ManifestWriter
       last_writer = *(it++);
       
-      // 处理已删除的列族，其对应的操作不需要写入 MANIFEST
+      // 特殊处理已删除的列族
+      if (last_writer->cfd->IsDropped()) {
+        if (!batch_edits.empty()) {
+          if (batch_edits.back()->IsInAtomicGroup() &&
+              batch_edits.back()->GetRemainingEntries() > 0) {
+            // 仅针对原子组（事务），并且还有操作未处理完
+            const auto& edit_list = last_writer->edit_list;
+            size_t k = 0;
+            while (k < edit_list.size()) {
+              if (!edit_list[k]->IsInAtomicGroup()) {
+                break;
+              } else if (edit_list[k]->GetRemainingEntries() == 0) {
+                ++k;
+                break;
+              }
+              ++k;
+            }
+            // 当列族被删除时，后续与该列族相关的操作会被跳过，不能写入到 MANIFEST 文件
+            // 如果原子组中有剩余的操作没有执行，通过更新 remaining_entries_ 来反映
+            // 已经跳过的操作数，避免恢复时系统认为有些未执行的操作依据完成出现错误
+            for (auto i = ; i < batch_edits.size(); ++i) {
+              batch_edits[i]->SetRemainingEntries(
+                  batch_edits[i]->GetRemainingEntries() -
+                  static_cast<uint32_t>(k));
+            }
+          }
+        }
+        continue;
+      }
       
       // 为每个列族找到或创建对应的 Version 和 VersionBuilder
       Version* version = nullptr;
@@ -146,16 +251,28 @@ Status VersionSet::ProcessManifestWrites(
         uint32_t cf_id = last_writer->cfd->GetID();
         if (versions[i]->cfd()->GetID() == cf_id) {
           version = versions[i];
+          builder = builder_guards[i]->version_builder();
           break;
         }
       }
-      
-      // 如果未找到对应的Version，为列族创建一个新的 Version 对象
-      // 及其关联的 VersionBuilder，用于后续的版本管理和变更操作...
-      
+      if (version == nullptr) {
+        if (!last_writer->IsAllWalEdits()) {
+          // wal 不需要应用到 version
+          // 为列族创建一个新的 Version 对象
+          // 及其关联的 VersionBuilder，用于后续的版本管理和变更操作
+          version = new Version(last_writer->cfd, this, file_options_,
+                                last_writer->mutable_cf_options, io_tracer_,
+                                current_version_number_++);
+          versions.push_back(version);
+          mutable_cf_options_ptrs.push_back(&last_writer->mutable_cf_options);
+          builder_guards.emplace_back(
+              new BaseReferencedVersionBuilder(last_writer->cfd));
+          builder = builder_guards.back()->version_builder();
+        }
+      }
       for (const auto& e : last_writer->edit_list) {
         if (e->IsInAtomicGroup()) {
-          // 原子操作，全部失败或全部成功，记录原子组操作起始位置
+          // 标记原子组的起始位置
           if (batch_edits.empty() || !batch_edits.back()->IsInAtomicGroup() ||
               (batch_edits.back()->IsInAtomicGroup() &&
                batch_edits.back()->GetRemainingEntries() == 0)) {
@@ -170,8 +287,12 @@ Status VersionSet::ProcessManifestWrites(
                                      &max_last_sequence, mu);
         
         // 如果错误释放已分配的资源...
+        
+        batch_edits.push_back(e);
+        batch_edits_ts_sz.push_back(edit_ts_sz);
       }
-    }
+    } 
+    
     for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
       // 将版本信息保存在对应的位置
       auto* builder = builder_guards[i]->version_builder();
@@ -193,23 +314,20 @@ Status VersionSet::ProcessManifestWrites(
   std::unordered_map<uint32_t, MutableCFState> curr_state;
   VersionEdit wal_additions;
   if (new_descriptor_log) {
-    //设置文件编号
+    // 设置文件编号
     pending_manifest_file_number_ = NewFileNumber();
     batch_edits.back()->SetNextFile(next_file_number_.load());
-
-    // 确保 MANIFSEST 包含最大列族ID
+    // 确保 MANIFSEST 包含最大列族 ID
     if (column_family_set_->GetMaxColumnFamily() > 0) {
       first_writer.edit_list.front()->SetMaxColumnFamily(
           column_family_set_->GetMaxColumnFamily());
     }
-    
     // 记录状态
     for (const auto* cfd : *column_family_set_) {
       curr_state.emplace(
           cfd->GetID(),
           MutableCFState(cfd->GetLogNumber(), cfd->GetFullHistoryTsLow()));
     }
-    
     // 添加 WAL 文件的记录		
     for (const auto& wal : wals_.GetWals()) {
       wal_additions.AddWal(wal.first, wal.second);
@@ -232,7 +350,7 @@ Status VersionSet::ProcessManifestWrites(
         descriptor_file->SetPreallocationBlockSize(
             db_options_->manifest_preallocation_size);
         
-        // 记录 MANIFEST 变更 ...
+        // ...
 
         // 写入当前记录到 manifest
         s = WriteCurrentStateToManifest(write_options, curr_state,
@@ -244,7 +362,7 @@ Status VersionSet::ProcessManifestWrites(
       if (!first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
         constexpr bool update_stats = true;
         for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
-          // 在非列族操作时，确保版本对象的元数据准备完毕
+          // 在非列族结构操作时，确保版本对象的元数据准备完毕
           versions[i]->PrepareAppend(*mutable_cf_options_ptrs[i], read_options,
                                      update_stats);
         }
@@ -252,7 +370,7 @@ Status VersionSet::ProcessManifestWrites(
       // 写入新纪录到日志
       for (size_t bidx = 0; bidx < batch_edits.size(); bidx++) {
         auto& e = batch_edits[bidx];
-        // 将文件添加到隔离列表，确保写入失败不会影响数据库的一致性和回复
+        // 将文件添加到隔离列表，确保写入失败不会影响数据库的一致性和恢复
         files_to_quarantine_if_commit_fail.push_back(
             e->GetFilesToQuarantineIfCommitFail());
         // 编码变更日志
@@ -297,7 +415,6 @@ Status VersionSet::ProcessManifestWrites(
     }
 
     // ...
-    
   }
 
   if (s.ok()) {
@@ -322,9 +439,11 @@ Status VersionSet::ProcessManifestWrites(
 
   if (s.ok()) {
     if (first_writer.edit_list.front()->IsColumnFamilyAdd()) {
+      // 处理 CF 的增加
       CreateColumnFamily(*new_cf_options, read_options,
                          first_writer.edit_list.front());
     } else if (first_writer.edit_list.front()->IsColumnFamilyDrop()) {
+      // 处理 CF 的删除
       first_writer.cfd->SetDropped();
       first_writer.cfd->UnrefAndTryDelete();
     } else {
@@ -354,7 +473,7 @@ Status VersionSet::ProcessManifestWrites(
       if (last_min_log_number_to_keep != 0) {
         MarkMinLogNumberToKeep(last_min_log_number_to_keep);
       }
-      // 设置最小日志号并将版本追加到列族
+      // 将 Version 添加到列族中的版本链表
       for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
         ColumnFamilyData* cfd = versions[i]->cfd_;
         AppendVersion(cfd, versions[i]);
@@ -382,7 +501,38 @@ Status VersionSet::ProcessManifestWrites(
     // 如果出现 CURRENT 错误，通常不会删除新的 MANIFEST 文件
   }
 
-  // ...
+  // 唤醒等待的 writers
+  while (true) {
+    ManifestWriter* ready = manifest_writers_.front();
+    manifest_writers_.pop_front();
+    bool need_signal = true;
+    
+    // 遍历 writers，检查当前处理的 ManifestWriter 是否是 writers 中的一
+    for (const auto& w : writers) {
+      if (&w == ready) {
+        need_signal = false;
+        break;
+      }
+    }
+    // 设置当前 writer 的状态为写入结果
+    ready->status = s;
+    ready->done = true;
+    if (ready->manifest_write_callback) {
+      (ready->manifest_write_callback)(s);
+    }
+    // 如果该 ManifestWriter 在 writers 中没有找到，则需要发送信号
+    if (need_signal) {
+      ready->cv.Signal();
+    }
+    if (ready == last_writer) {
+      break;
+    }
+  }
+  // 唤醒下一批 writers 执行
+  if (!manifest_writers_.empty()) {
+    manifest_writers_.front()->cv.Signal();
+  }
+  
 }
 
 Status VersionSet::WriteCurrentStateToManifest(
