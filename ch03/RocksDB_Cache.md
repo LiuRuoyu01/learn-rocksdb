@@ -461,10 +461,6 @@ bool FixedHyperClockTable::Release(HandleImpl* h, bool useful,
     old_meta = h->meta.FetchSub(ClockHandle::kAcquireIncrement);
   }
 
-  // 确保状态为 Shareable
-  assert((old_meta >> ClockHandle::kStateShift) &
-         ClockHandle::kStateShareableBit);
-
   if (erase_if_last_ref || UNLIKELY(old_meta >> ClockHandle::kStateShift ==
                                     ClockHandle::kStateInvisible)) {
     // 更新引用计数
@@ -504,6 +500,7 @@ bool FixedHyperClockTable::Release(HandleImpl* h, bool useful,
     }
     return true;
   } else {
+    // 防止引用计数溢出
     CorrectNearOverflow(old_meta, h->meta);
     return false;
   }
@@ -558,5 +555,33 @@ void FixedHyperClockTable::Erase(const UniqueId64x2& hashed_key) {
       [&](HandleImpl* h) { return h->displacements.LoadRelaxed() == 0; },
       [&](HandleImpl* /*h*/, bool /*is_last*/) {});
 }
+
+template <typename MatchFn, typename AbortFn, typename UpdateFn>
+inline FixedHyperClockTable::HandleImpl* FixedHyperClockTable::FindSlot(
+    const UniqueId64x2& hashed_key, const MatchFn& match_fn,
+    const AbortFn& abort_fn, const UpdateFn& update_fn) {
+  size_t base = static_cast<size_t>(hashed_key[1]);
+  // 确保增量值与表大小互质（即不共享因子），避免陷入死循环
+  size_t increment = static_cast<size_t>(hashed_key[0]) | 1U;
+  size_t first = ModTableSize(base);
+  size_t current = first;
+  bool is_last;
+  do {
+    HandleImpl* h = &array_[current];
+    if (match_fn(h)) {
+      return h;
+    }
+    if (abort_fn(h)) {
+      return nullptr;
+    }
+    // 多次探测直到探测完所有的槽
+    current = ModTableSize(current + increment);
+    is_last = current == first;
+    update_fn(h, is_last);
+  } while (!is_last);
+
+  return nullptr;
+}
+
 ```
 
