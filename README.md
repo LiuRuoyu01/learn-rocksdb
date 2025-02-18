@@ -15,6 +15,7 @@
 - [3. 主要功能块介绍](./ch03)
   - [3.1. 布隆过滤器](./ch03/RocksDB_BloomFilter.md)
   - [3.2. 块缓存](./ch03/RocksDB_Cache.md)
+  - [3.3.版本](./ch03/RocksDB_Version.md)
 
 
 ## 说明
