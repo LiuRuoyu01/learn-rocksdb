@@ -9,6 +9,18 @@ Block Cache 是 RocksDB 用于 **读操作** 的内存缓存，存储了从 SST 
 - 哈希表：根据键（Key）和哈希值直接定位 Entries 在缓存中的位置，同时还记录 Entries 的位置（例如指向 LRU 链表节点的指针）。哈希表**仅负责查找和存储，不记录 Entries 使用的时间或顺序**。通过单链表来解决 hash 冲突，每次针对 hash 表的链表插入都会采用头插法，保证越新的 key 越靠近 bucket 头部
 - LRUCache：双链表，记录 Entries 的使用顺序，**动态更新 Entries 顺序（每当 Entries 被访问时，从链表中移除该 Entries ，等 Realse 之后重新插入到 LRU 中）** 。通过节点链接，维护 Entries 之间的关系，实际的数据存储和快速定位由哈希表负责
 
+LRU 存在三种状态
+
+1. 外部引用（refs >= 1），在哈希表中（in_cache == true）：entry 不在 LRU 表中
+2. 未被外部引用（refs == 0），在哈希表中（in_cache == true）： entry 在 LRU 表，可以被 free
+3. 外部引用（refs >= 1），不在哈希表中（in_cache == false）：entry 即不在 LRU 也不在 Hash 表，如果在此状态下 refs 变为 0 则必须被 free 
+
+状态变化：
+
+- 状态 1 to 状态 2：Release
+- 状态 1 to 状态 3：Erase 或 Insert 一个相同的 key
+- 状态 2 to 状态 1：LookUp
+
 启用 **cache_index_and_filter_blocks_with_high_priority （高优先级）** 后，Block Cache 的 LRU 列表会被分为两部分：
 
 - **高优先级池（High-pri Pool）**：存储索引块、过滤器块和压缩字典块。
@@ -128,7 +140,6 @@ LRUHandle* LRUCacheShard::Lookup(const Slice& key, uint32_t hash,
   DMutexLock l(mutex_);
   LRUHandle* e = table_.Lookup(key, hash);
   if (e != nullptr) {
-    assert(e->InCache());
     if (!e->HasRefs()) {
       // LRU 链表的职责是逐出未被引用的条目，而引用计数的职责是保护被外部使用的条目
       // 当条目被引用时，应切换到引用计数管理，从链表移除
@@ -166,7 +177,7 @@ bool LRUCacheShard::Release(LRUHandle* e, bool /*useful*/,
         must_free = false;
       }
     }
-    // ... 释放条目
+    // ... 
 }
 
 void LRUCacheShard::LRU_Insert(LRUHandle* e) {
@@ -351,6 +362,9 @@ state marker:     标记条目的状态
 // 固定大小的缓存表，支持高效的查找，适合静态容量管理。
 // 采用开放寻址法，在发生哈希冲突时，使用一个次级哈希函数来计算步长，所有条目存储在哈希表本身
 // 哈希表中的条目插入后位置是固定的，不能因后续插入或删除操作而移动
+// 当 entry 被删除时会留下空洞，通过记录位移计数器 displacements 解决此问题
+// displacements 记录了有多少个元素原本应该位于该槽位或更低的位置
+// FindSlot 通过 displacements 做查找的终止条件
 class FixedHyperClockTable : public BaseClockTable {
 
   // 默认负载为0.7，严格控制上限为0.84
