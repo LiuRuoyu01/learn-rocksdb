@@ -93,13 +93,174 @@ LAST == 4       // 用户记录所有内部片段的类型
 
 文件系统还需要更新元数据信息，这些元数据信息也需要写会磁盘，也需要占用整页的空间
 
+```c++
+// 单线程写入 WAL
+IOStatus DBImpl::WriteToWAL(const WriteThread::WriteGroup& write_group,
+                            log::Writer* log_writer, uint64_t* log_used,
+                            bool need_log_sync, bool need_log_dir_sync,
+                            SequenceNumber sequence,
+                            LogFileNumberSize& log_file_number_size) {
+  IOStatus io_s;
+  assert(!two_write_queues_);
+  assert(!write_group.leader->disable_wal);
+  // 合并事务组中的多个 WriteBatch，提高 WAL 写入效率
+  size_t write_with_wal = 0;
+  WriteBatch* to_be_cached_state = nullptr;
+  WriteBatch* merged_batch;
+  io_s = status_to_io_status(MergeBatch(write_group, &tmp_batch_, &merged_batch,
+                                        &write_with_wal, &to_be_cached_state));
+  
+  if (merged_batch == write_group.leader->batch) {
+    // Leader 线程的 log_used 记录当前 logfile_number_
+    write_group.leader->log_used = logfile_number_;
+  } else if (write_with_wal > 1) {
+    // 如果多个事务写入 WAL，所有 write_group 的事务共享相同的 logfile_number_
+    for (auto writer : write_group) {
+      writer->log_used = logfile_number_;
+    }
+  }
+
+  WriteBatchInternal::SetSequence(merged_batch, sequence);
+
+  // 真正执行 WAL 写入
+  uint64_t log_size;
+  WriteOptions write_options;
+  write_options.rate_limiter_priority =
+      write_group.leader->rate_limiter_priority;
+  io_s = WriteToWAL(*merged_batch, write_options, log_writer, log_used,
+                    &log_size, log_file_number_size);
+
+  if (io_s.ok() && need_log_sync) {
+    // 在 Sync（）操作前，不加锁读取 logs_
+    //  - getting_synced=true，标志意味着当前日志正在进行同步，因此其他线程不会尝试删除 logs_ 中的日志文件
+    //  - 只有写线程能够向 logs_ 添加新的 WAL 文件，
+    //  - 只要其他线程不修改 logs_，多个线程并发读 std::deque 安全
+    
+    // Sync() 操作时需要加锁
+    //  manual_wal_flush_ 允许手动触发其他线程 FlushWAL
+    //  在 WAL 同步到磁盘期间，如果多个线程同时 Sync()，可能会出现文件损坏的情况。
+    const bool needs_locking = manual_wal_flush_ && !two_write_queues_;
+    if (UNLIKELY(needs_locking)) {
+      log_write_mutex_.Lock();
+    }
+
+    // 进行 WAL 同步
+    if (io_s.ok()) {
+      for (auto& log : logs_) {
+        IOOptions opts;
+        io_s = WritableFileWriter::PrepareIOOptions(write_options, opts);
+        if (!io_s.ok()) {
+          break;
+        }
+        // 如果之前的 WAL 文件同步操作失败，可能已经完全同步且已关闭
+        // 只需要在 Manifest 中标记为已同步
+        if (auto* f = log.writer->file()) {
+          io_s = f->Sync(opts, immutable_db_options_.use_fsync);
+          if (!io_s.ok()) {
+            break;
+          }
+        }
+      }
+    }
+
+    if (UNLIKELY(needs_locking)) {
+      log_write_mutex_.Unlock();
+    }
+
+    // 进行 WAL 目录同步
+    if (io_s.ok() && need_log_dir_sync) {
+      // WAL 目录只会在第一次 WAL 同步时进行同步，如果用户未启用 WAL 同步也不会对目录进行同步
+      io_s = directories_.GetWalDir()->FsyncWithDirOptions(
+          IOOptions(), nullptr,
+          DirFsyncOptions(DirFsyncOptions::FsyncReason::kNewFileSynced));
+    }
+  }
+  // ...
+}
+
+// 在 two_write_queues_ 或 unordered_write 启用时使用
+IOStatus DBImpl::ConcurrentWriteToWAL(
+    const WriteThread::WriteGroup& write_group, uint64_t* log_used,
+    SequenceNumber* last_sequence, size_t seq_inc) {
+  IOStatus io_s;
+
+  assert(two_write_queues_ || immutable_db_options_.unordered_write);
+  assert(!write_group.leader->disable_wal);
+  // 合并事务组中的多个 WriteBatch，提高 WAL 写入效率
+  WriteBatch tmp_batch;
+  size_t write_with_wal = 0;
+  WriteBatch* to_be_cached_state = nullptr;
+  WriteBatch* merged_batch;
+  io_s = status_to_io_status(MergeBatch(write_group, &tmp_batch, &merged_batch,
+                                        &write_with_wal, &to_be_cached_state));
+  if (UNLIKELY(!io_s.ok())) {
+    return io_s;
+  }
+
+  // 由于是多线程需要获取锁
+  log_write_mutex_.Lock();
+  
+  if (merged_batch == write_group.leader->batch) {
+    // Leader 线程的 log_used 记录当前 logfile_number_
+    write_group.leader->log_used = logfile_number_;
+  } else if (write_with_wal > 1) {
+    // 如果多个事务写入 WAL，所有 write_group 的事务共享相同的 logfile_number_
+    for (auto writer : write_group) {
+      writer->log_used = logfile_number_;
+    }
+  }
+  // 设置 WAL 全局事务序列号
+  *last_sequence = versions_->FetchAddLastAllocatedSequence(seq_inc);
+  auto sequence = *last_sequence + 1;
+  WriteBatchInternal::SetSequence(merged_batch, sequence);
+
+  // 从 logs_（日志文件列表） 获取最新的 log_writer
+  log::Writer* log_writer = logs_.back().writer;
+  LogFileNumberSize& log_file_number_size = alive_log_files_.back();
+
+  // 真正执行 WAL 写入
+  uint64_t log_size;
+  WriteOptions write_options;
+  write_options.rate_limiter_priority =
+      write_group.leader->rate_limiter_priority;
+  io_s = WriteToWAL(*merged_batch, write_options, log_writer, log_used,
+                    &log_size, log_file_number_size);
+  log_write_mutex_.Unlock();
+  // ...
+}
 
 
 
+IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
+                            const WriteOptions& write_options,
+                            log::Writer* log_writer, uint64_t* log_used,
+                            uint64_t* log_size,
+                            LogFileNumberSize& log_file_number_size) {
+  // 获取 WriteBatch 日志内容
+  Slice log_entry = WriteBatchInternal::Contents(&merged_batch);
 
+  *log_size = log_entry.size();
+  const bool needs_locking = manual_wal_flush_ && !two_write_queues_;
+  if (UNLIKELY(needs_locking)) {
+    log_write_mutex_.Lock();
+  }
+  // 添加时间戳
+  IOStatus io_s = log_writer->MaybeAddUserDefinedTimestampSizeRecord(
+      write_options, versions_->GetColumnFamiliesTimestampSizeForRecord());
+  if (!io_s.ok()) {
+    return io_s;
+  }
+  // 写入 WAL
+  io_s = log_writer->AddRecord(write_options, log_entry);
 
-
-
-
-
+  if (UNLIKELY(needs_locking)) {
+    log_write_mutex_.Unlock();
+  }
+  // 记录文件变化
+  if (log_used != nullptr) {
+    *log_used = logfile_number_;
+  }
+  // ...
+}
+```
 
