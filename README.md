@@ -1,6 +1,6 @@
 # learn-rocksdb
 
-由于工作需要，便开始学习RocksDB源码，并记录自己的学习过程。在学习过程中发现网上较少有关于对RocksDB的教程，所以将学习文档分享出来供大家参考
+由于工作需要，便开始学习RocksDB源码，并记录自己的学习过程。将学习文档分享出来供大家参考，希望对大家能有一些帮助
 
 ## 目录
 
@@ -16,6 +16,9 @@
   - [3.1. 布隆过滤器](./ch03/RocksDB_BloomFilter.md)
   - [3.2. 块缓存](./ch03/RocksDB_Cache.md)
   - [3.3.版本](./ch03/RocksDB_Version.md)
+- [4. 流程介绍](./ch04)
+  - [4.1. 写流程](./ch04/RocksDB_Write.md)
+  
 
 
 ## 说明
