@@ -17,22 +17,39 @@ RocksDB的写请求写入到MemTable后就认为是写成功了，MemTable存放
 memtable 可以在其满之前被刷新，后续章节会对flush进行详细的讲解
 
 ```c++
-//存入MemTable的kv数据格式
+// 存入MemTable的kv数据格式
 |-internal_key_size-|---key---|--seq--type|--value_size--|--value--|
-//internal_key_size : varint类型，包括key、seq、type所占的字节数
-//key：字符串，就是Put进来的key字符串seq：
-//序列号，占7个字节type：
-//操作类型，占1个字节（Put or Dlete）
-//value_size：varint类型，表示value的长度
-//value：字符串，就是Put进来的value字符串
+// internal_key_size :  varint 类型，包括 key、seq、type 所占的字节数
+// key :                字符串，就是 Put 进来的 key 字符串
+// seq :                占 7 个字节
+// type :               占 1 个字节（Put or Dlete）
+// value_size :         varint 类型，表示 value 的长度
+// value :              字符串，就是 Put 进来的 value 字符串
 ```
 
 ```c++
-class MemTable{  
+class ReadOnlyMemTable{  
   ...  
-  KeyComparator comparator_; // 用于比较key的大小  	
-  std::unique_ptr<MemTableRep> table_; // 指向skiplist  
-  std::unique_ptr<MemTableRep> range_del_table_;// 指向skiplist，用于kTypeRangeDeletion类型(memtable支持范围删除)
+  int refs_{0};              // MemTable 的生命周期由引用计数管理，防止在仍有引用时被释放
+  
+  bool flush_in_progress_;   // started the flush  
+  bool flush_completed_;     // finished the flush  
+  uint64_t file_number_;     // 记录当前 MemTable 刷盘生成的 SST 文件编号
+  
+  VersionEdit edit_;         // 记录 MemTable 刷盘到存储时的元数据信息
+  uint64_t mem_next_logfile_number_{0}; // 表示可以安全删除的日志文件（WAL）的最小编号
+  
+  // 表示负责该 MemTable 的原子刷盘的序列号，确保一致性
+  // 小于此序列号的所有写入都已刷盘，大于等于此序列号的写入不会被刷盘
+  SequenceNumber atomic_flush_seqno_{kMaxSequenceNumber}; 
+};
+
+class MemTable final : public ReadOnlyMemTable {
+  ...
+
+  KeyComparator comparator_; // 用于比较 key 的大小  	
+  std::unique_ptr<MemTableRep> table_; // 指向 skiplist  
+  std::unique_ptr<MemTableRep> range_del_table_;// 指向 skiplist，用于 kTypeRangeDeletion 类型(memtable 支持范围删除)
 
   // 统计信息
   std::atomic<uint64_t> data_size_;  
@@ -58,18 +75,6 @@ class MemTable{
   std::mutex range_del_mutex_;
   CoreLocalArray<std::shared_ptr<FragmentedRangeTombstoneListCache>>
       cached_range_tombstone_;
-  
-  
-  bool flush_in_progress_;   // started the flush  
-  bool flush_completed_;     // finished the flush  
-  uint64_t file_number_;     // 记录当前 MemTable 刷盘生成的 SST 文件编号
-  
-  VersionEdit edit_;         // 记录 MemTable 刷盘到存储时的元数据信息
-  uint64_t mem_next_logfile_number_{0}; // 表示可以安全删除的日志文件（WAL）的最小编号
-  
-  // 表示负责该 MemTable 的 原子刷盘 的序列号，确保一致性
-  // 小于此序列号的所有写入都已刷盘，大于等于此序列号的写入不会被刷盘
-  SequenceNumber atomic_flush_seqno_{kMaxSequenceNumber}; 
 };
 
 
@@ -84,17 +89,17 @@ Status MemTable::Add(SequenceNumber s, ValueType type, const Slice& key, /* user
   // value bytes  : char[value.size()]  
   uint32_t key_size = static_cast<uint32_t>(key.size());  
   uint32_t val_size = static_cast<uint32_t>(value.size());  
-  uint32_t internal_key_size = key_size + 8;  		//8是 序列号的7字节 + 操作形式的1字节
+  uint32_t internal_key_size = key_size + 8;  		// 8 是序列号的 7 字节 + 操作形式的 1 字节
   const uint32_t encoded_len = VarintLength(internal_key_size) + 
     internal_key_size + VarintLength(val_size) +                               
     val_size; 
   char* buf = nullptr;  
   
-  // 通过判断key-value的类型来选择memtable, 范围删除的kv插入range_del_table_
+  // 通过判断 key-value 的类型来选择 memtable, 范围删除的 kv 插入 range_del_table_
   std::unique_ptr<MemTableRep>& table =      
     type == kTypeRangeDeletion ? range_del_table_ : table_;
   
-  //申请内存空间，并将数据拷贝到内存中去
+  // 申请内存空间，并将数据拷贝到内存中去
   KeyHandle handle = table->Allocate(encoded_len, &buf);
   char* p = EncodeVarint32(buf, internal_key_size);  
   memcpy(p, key.data(), key_size);  
@@ -109,10 +114,9 @@ Status MemTable::Add(SequenceNumber s, ValueType type, const Slice& key, /* user
                       buf + encoded_len - moptions_.protection_bytes_per_key);
   
   
-  // allow_concurrent默认为false 
-  //是否开启并发写入
+  // 是否开启并发写入，allow_concurrent 默认为 false 
   if (!allow_concurrent) {    
-    // 带hint插入，通过map记录一些前缀插入skiplist的位置，从而再次插入相同前缀的key时快速找到位置    
+    // 带 hint 插入，通过 map 记录一些前缀插入 skiplist 的位置，从而再次插入相同前缀的 key 时快速找到位置    
     // 默认不启用   
     if (insert_with_hint_prefix_extractor_ != nullptr && 
         insert_with_hint_prefix_extractor_->InDomain(key_slice)) {      
@@ -122,7 +126,7 @@ Status MemTable::Add(SequenceNumber s, ValueType type, const Slice& key, /* user
           return res;      
       }    
     } else {   
-      //插入到skiplist   
+      //插入到 skiplist   
       bool res = table->InsertKey(handle); 
     }
     
@@ -147,7 +151,7 @@ Status MemTable::Add(SequenceNumber s, ValueType type, const Slice& key, /* user
     }
     
     // 确保内存表中序号的一致性
-    // 第一个序号为0或者当前操作序号大于等于第一个序号
+    // 第一个序号为 0 或者当前操作序号大于等于第一个序号
     assert(first_seqno_ == 0 || s >= first_seqno_);    
     if (first_seqno_ == 0) {      
       first_seqno_.store(s, std::memory_order_relaxed);
@@ -227,7 +231,7 @@ bool MemTable::Get(const LookupKey& key, std::string* value,
   
   // ...
 	
-  // 在range_del_table_上初始化一个迭代器，用于遍历范围删除的记录
+  // 在range_del_table_ 上初始化一个迭代器，用于遍历范围删除的记录
   std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
       NewRangeTombstoneIterator(read_opts,
                                 GetInternalKeySeqno(key.internal_key()),
@@ -245,7 +249,7 @@ bool MemTable::Get(const LookupKey& key, std::string* value,
 
   //...
   
-  //用布隆过滤器判断键是否可能存在memtable里面
+  //用布隆过滤器判断键是否可能存在 memtable 里面
   if (bloom_filter_) {
     // 全键过滤
     if (moptions_.memtable_whole_key_filtering) {
@@ -314,18 +318,18 @@ bool MemTable::ShouldFlushNow() {
 
 ```c++
 char* InlineSkipList<Comparator>::AllocateKey(size_t key_size) {  
-  //这里会随机一个高度，也就是跳表里面一个节点的高度  
+  // 这里会随机一个高度，也就是跳表里面一个节点的高度  
   return const_cast<char*>(AllocateNode(key_size, RandomHeight())->Key());
 }
 
-//为一个新的跳表节点分配内存
+// 为一个新的跳表节点分配内存
 InlineSkipList<Comparator>::AllocateNode(size_t key_size, int height) {  
-  //每个指针指向该高度的下一个节点高度，最底下的节点暂时无指向
+  // 每个指针指向该高度的下一个节点高度，最底下的节点暂时无指向
   auto prefix = sizeof(std::atomic<Node*>) * (height - 1);
-  //通过Arena::AllocateAligned或者ConcurrentArena::AllocateAligned去申请内存  
+  // 通过 Arena::AllocateAligned 或者 ConcurrentArena::AllocateAligned 去申请内存  
   char* raw = allocator_->AllocateAligned(prefix + sizeof(Node) + key_size);  
 
-  //将节点高度暂时存储在高度为1的位置，插入跳表完成后就不需要高度了,这个位置就会存放指向下一个节点的指针 
+  // 将节点高度暂时存储在高度为 1 的位置，插入跳表完成后就不需要高度了,这个位置就会存放指向下一个节点的指针 
   Node* x = reinterpret_cast<Node*>(raw + prefix);
   x->StashHeight(height); 
   
