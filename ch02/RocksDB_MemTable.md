@@ -1,3 +1,5 @@
+
+
 ## MemTable文件
 
 RocksDB的写请求写入到MemTable后就认为是写成功了，MemTable存放在内存中的，他保存了__落盘到SST文件前的数据__。同时服务于读和写，新的写入总是将数据插入到MemTable。一旦一个MemTable被写满（或者满足一定条件），他会变成不可修改的MemTable，即ImMemTable，并被一个新的MemTable替换。一个后台线程会将ImMemTable的内容落盘到一个SST文件，然后ImMemTable就可以被销毁了。
@@ -76,8 +78,11 @@ class MemTable final : public ReadOnlyMemTable {
   CoreLocalArray<std::shared_ptr<FragmentedRangeTombstoneListCache>>
       cached_range_tombstone_;
 };
+```
 
+#### Add 操作
 
+```c++
 Status MemTable::Add(SequenceNumber s, ValueType type, const Slice& key, /* user key */  
                    const Slice& value, bool allow_concurrent,
                    MemTablePostProcessInfo*post_process_info, void** hint) {  
@@ -221,6 +226,11 @@ Status MemTable::Add(SequenceNumber s, ValueType type, const Slice& key, /* user
   return Status::OK();
 }
 
+```
+
+#### Get 操作
+
+```c++
 bool MemTable::Get(const LookupKey& key, std::string* value,
                    PinnableWideColumns* columns, std::string* timestamp,
                    Status* s, MergeContext* merge_context,
@@ -228,35 +238,44 @@ bool MemTable::Get(const LookupKey& key, std::string* value,
                    SequenceNumber* seq, const ReadOptions& read_opts,
                    bool immutable_memtable, ReadCallback* callback,
                    bool* is_blob_index, bool do_merge) {
-  
-  // ...
-	
-  // 在range_del_table_ 上初始化一个迭代器，用于遍历范围删除的记录
+
+  if (IsEmpty()) {
+    return false;
+  }
+
+  // 初始化一个迭代器，用于遍历范围删除的记录，检查 key 是否被范围删除覆盖
   std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
       NewRangeTombstoneIterator(read_opts,
                                 GetInternalKeySeqno(key.internal_key()),
                                 immutable_memtable));
   if (range_del_iter != nullptr) {
-    // 获取范围删除中包含此键的最大序号
+    // 当前 memtable 中存在范围删除的操作，需要检查是否含有目标 key
+    // covering_seq 为覆盖目标 Key 的最新范围删除操作的序列号
     SequenceNumber covering_seq =
         range_del_iter->MaxCoveringTombstoneSeqnum(key.user_key());
-    // 如果删除的序号大于此序号，则范围删除优先级最高
     if (covering_seq > *max_covering_tombstone_seq) {
+      // 记录当前 key 被删除的最新状态，用于后续判断 key 是否有效
       *max_covering_tombstone_seq = covering_seq;
-      //更新时间戳
+      if (timestamp) {
+        timestamp->assign(range_del_iter->timestamp().data(),
+                          range_del_iter->timestamp().size());
+      }
     }
   }
 
-  //...
-  
+  bool found_final_value = false;
+  bool merge_in_progress = s->IsMergeInProgress();
+  bool may_contain = true;
+  Slice user_key_without_ts = StripTimestampFromUserKey(key.user_key(), ts_sz_);
+  bool bloom_checked = false;
   //用布隆过滤器判断键是否可能存在 memtable 里面
-  if (bloom_filter_) {
-    // 全键过滤
+  if (bloom_filter_) {    
     if (moptions_.memtable_whole_key_filtering) {
+      // 全键过滤
       may_contain = bloom_filter_->MayContain(user_key_without_ts);
       bloom_checked = true;
     } else {
-      //如果设置了前缀提词器则对前缀进行过滤，前缀过滤器通常用于范围查询
+      // 如果设置了前缀提词器则对前缀进行过滤，前缀过滤器通常用于范围查询
       if (prefix_extractor_->InDomain(user_key_without_ts)) {
         may_contain = bloom_filter_->MayContain(
             prefix_extractor_->Transform(user_key_without_ts));
@@ -264,27 +283,128 @@ bool MemTable::Get(const LookupKey& key, std::string* value,
       }
     }
   }
-	
+
   if (bloom_filter_ && !may_contain) {
-    // 如果布隆过滤器判断键不在，则键肯定不存在
-    PERF_COUNTER_ADD(bloom_memtable_miss_count, 1);
+    // 布隆过滤器未找到标记 key 不存在
     *seq = kMaxSequenceNumber;
   } else {
-    if (bloom_checked) {
-      PERF_COUNTER_ADD(bloom_memtable_hit_count, 1);
-    }
-    //进行精确查找
+    // 执行 memtable 的坚持
     GetFromTable(key, *max_covering_tombstone_seq, do_merge, callback,
                  is_blob_index, value, columns, timestamp, s, merge_context,
                  seq, &found_final_value, &merge_in_progress);
   }
 
-  //...
-  
-  PERF_COUNTER_ADD(get_from_memtable_count, 1);
+  if (!found_final_value && merge_in_progress) {
+    // 未找到最终值并存在未完成的合并操作，此时应该处于合并的状态中
+    if (s->ok()) {
+      *s = Status::MergeInProgress();
+    } else {
+      assert(s->IsMergeInProgress());
+    }
+  }
+
   return found_final_value;
 }
 
+void MemTable::GetFromTable(const LookupKey& key,
+                            SequenceNumber max_covering_tombstone_seq,
+                            bool do_merge, ReadCallback* callback,
+                            bool* is_blob_index, std::string* value,
+                            PinnableWideColumns* columns,
+                            std::string* timestamp, Status* s,
+                            MergeContext* merge_context, SequenceNumber* seq,
+                            bool* found_final_value, bool* merge_in_progress) {
+  // 封装查询所有需要的信息
+  Saver saver;
+  saver.status = s;
+  saver.found_final_value = found_final_value;
+  saver.merge_in_progress = merge_in_progress;
+  saver.key = &key;
+  saver.value = value;
+  saver.columns = columns;
+  saver.timestamp = timestamp;
+  saver.seq = kMaxSequenceNumber;
+  saver.mem = this;
+  saver.merge_context = merge_context;
+  saver.max_covering_tombstone_seq = max_covering_tombstone_seq;
+  saver.merge_operator = moptions_.merge_operator;
+  saver.logger = moptions_.info_log;
+  saver.inplace_update_support = moptions_.inplace_update_support;
+  saver.statistics = moptions_.statistics;
+  saver.clock = clock_;
+  saver.callback_ = callback;
+  saver.is_blob_index = is_blob_index;
+  saver.do_merge = do_merge;
+  saver.allow_data_in_errors = moptions_.allow_data_in_errors;
+  saver.protection_bytes_per_key = moptions_.protection_bytes_per_key;
+
+  if (!moptions_.paranoid_memory_checks) {
+    // 查询
+    table_->Get(key, &saver, SaveValue);
+  } else {
+    ...
+  }
+  assert(s->ok() || s->IsMergeInProgress() || *found_final_value);
+  *seq = saver.seq;
+}
+
+
+void MemTableRep::Get(const LookupKey& k, void* callback_args,
+                      bool (*callback_func)(void* arg, const char* entry)) {
+  // 获取一个迭代器，通过这个迭代器去去 skiplist 查询对应的 key
+  auto iter = GetDynamicPrefixIterator();
+  // 如果能在 skiplist 查找到对应的 key，就进入回调 callback_func 函数（SaveValue）
+  // 最终通过 SaveValue 函数从 iter->key() 中提取出 key 和 value
+  for (iter->Seek(k.internal_key(), k.memtable_key().data());
+       iter->Valid() && callback_func(callback_args, iter->key());
+       iter->Next()) {
+  }
+}
+```
+
+##### IMMemtable
+
+```c++
+bool MemTableListVersion::GetFromList(
+    std::list<ReadOnlyMemTable*>* list, const LookupKey& key,
+    std::string* value, PinnableWideColumns* columns, std::string* timestamp,
+    Status* s, MergeContext* merge_context,
+    SequenceNumber* max_covering_tombstone_seq, SequenceNumber* seq,
+    const ReadOptions& read_opts, ReadCallback* callback, bool* is_blob_index) {
+  // 初始化序列号
+  *seq = kMaxSequenceNumber;
+  for (auto& memtable : *list) {
+    // 遍历 immemtable list（从新到旧），从每个 immemtable 中去读取数据，流程同 memtable 读
+    assert(memtable->IsFragmentedRangeTombstonesConstructed());
+    SequenceNumber current_seq = kMaxSequenceNumber;
+
+    bool done =
+        memtable->Get(key, value, columns, timestamp, s, merge_context,
+                      max_covering_tombstone_seq, &current_seq, read_opts,
+                      true /* immutable_memtable */, callback, is_blob_index);
+    if (*seq == kMaxSequenceNumber) {
+      // 因为遍历顺序为从新到旧，所以首个遇到的 seq 即为该键的最新操作序号
+      *seq = current_seq;
+    }
+
+    if (done) {
+      assert(*seq != kMaxSequenceNumber ||
+             (!s->ok() && !s->IsMergeInProgress()));
+      return true;
+    }
+    if (!s->ok() && !s->IsMergeInProgress() && !s->IsNotFound()) {
+      return false;
+    }
+  }
+  return false;
+}
+```
+
+
+
+#### Flush 操作
+
+```c++
 bool MemTable::ShouldFlushNow() {
   // 判断是否因为范围删除触发刷盘
   if (memtable_max_range_deletions_ > 0 &&
@@ -313,8 +433,9 @@ bool MemTable::ShouldFlushNow() {
   return arena_.AllocatedAndUnused() < kArenaBlockSize / 4;
 }
 
-
 ```
+
+#### 跳表相关操作
 
 ```c++
 char* InlineSkipList<Comparator>::AllocateKey(size_t key_size) {  
