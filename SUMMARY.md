@@ -12,3 +12,4 @@
   - [3.3.版本](./ch03/RocksDB_Version.md)
 - [4. 流程介绍](./ch04)
   - [4.1. 写流程](./ch04/RocksDB_Write.md)
+  - [4.2. 读流程](./ch04/RocksDB_Read.md)
