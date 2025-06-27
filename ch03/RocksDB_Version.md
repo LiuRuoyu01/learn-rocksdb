@@ -162,6 +162,284 @@ uint64_t current_version_number_;
 }
 ```
 
+#### Get 操作
+
+```c++
+void Version::Get(const ReadOptions& read_options, const LookupKey& k,
+                  PinnableSlice* value, PinnableWideColumns* columns,
+                  std::string* timestamp, Status* status,
+                  MergeContext* merge_context,
+                  SequenceNumber* max_covering_tombstone_seq,
+                  PinnedIteratorsManager* pinned_iters_mgr, bool* value_found,
+                  bool* key_exists, SequenceNumber* seq, ReadCallback* callback,
+                  bool* is_blob, bool do_merge) {
+  Slice ikey = k.internal_key();
+  Slice user_key = k.user_key();
+
+  if (key_exists != nullptr) {
+    *key_exists = true;
+  }
+
+  // KV 分离架构，后续 compaction 章节有介绍
+  // 旧版 blob_index 通过外部参数 is_blob 显示标记，新版内部支持原生的 blob_index，通过 value 类型进行隐式识别
+  bool is_blob_index = false;
+  bool* const is_blob_to_use = is_blob ? is_blob : &is_blob_index;
+  // 初始化 blob 数据读取
+  BlobFetcher blob_fetcher(this, read_options);
+
+  GetContext get_context(
+      user_comparator(), merge_operator_, info_log_, db_statistics_,
+      status->ok() ? GetContext::kNotFound : GetContext::kMerge, user_key,
+      do_merge ? value : nullptr, do_merge ? columns : nullptr,
+      do_merge ? timestamp : nullptr, value_found, merge_context, do_merge,
+      max_covering_tombstone_seq, clock_, seq,
+      merge_operator_ ? pinned_iters_mgr : nullptr, callback, is_blob_to_use,
+      tracing_get_id, &blob_fetcher);
+
+  // merge 操作锁定 block 防止提前释放数据块
+  if (merge_operator_) {
+    pinned_iters_mgr->StartPinning();
+  }
+
+  // 初始化 FilePicker，根据 key 定位文件
+  FilePicker fp(user_key, ikey, &storage_info_.level_files_brief_,
+                storage_info_.num_non_empty_levels_,
+                &storage_info_.file_indexer_, user_comparator(),
+                internal_comparator());
+  FdWithKeyRange* f = fp.GetNextFile();
+
+  while (f != nullptr) {
+    if (*max_covering_tombstone_seq > 0) {
+      // 在一个比当前查询目标 Key 更新的删除操作
+      break;
+    }
+  
+    // 从 tablecache 中查询 Key 可能所在的 SST 文件及具体数据块，在 cache 章节有详细解析
+    *status = table_cache_->Get(
+        read_options, *internal_comparator(), *f->file_metadata, ikey,
+        &get_context, mutable_cf_options_,
+        cfd_->internal_stats()->GetFileReadHist(fp.GetHitFileLevel()),
+        IsFilterSkipped(static_cast<int>(fp.GetHitFileLevel()),
+                        fp.IsHitFileLastInLevel()),
+        fp.GetHitFileLevel(), max_file_size_for_l0_meta_pin_);
+
+    if (!status->ok()) {
+      return;
+    }
+
+    switch (get_context.State()) {
+      case GetContext::kNotFound:
+        break;
+      case GetContext::kMerge:
+        break;
+      case GetContext::kFound:
+        if (is_blob_index && do_merge && (value || columns)) {
+          // 获取 blob 索引数据
+          Slice blob_index =
+              value ? *value
+                    : WideColumnsHelper::GetDefaultColumn(columns->columns());
+
+          constexpr FilePrefetchBuffer* prefetch_buffer = nullptr;
+
+          // 加载 blob 数据
+          PinnableSlice result;
+          constexpr uint64_t* bytes_read = nullptr;
+          *status = GetBlob(read_options, get_context.ukey_to_get_blob_value(),
+                            blob_index, prefetch_buffer, &result, bytes_read);
+          if (!status->ok()) {
+            if (status->IsIncomplete()) {
+              get_context.MarkKeyMayExist();
+            }
+            return;
+          }
+
+          if (value) {
+            *value = std::move(result);
+          } else {
+            assert(columns);
+            columns->SetPlainValue(std::move(result));
+          }
+        }
+
+        return;
+      case GetContext::kDeleted:
+        *status = Status::NotFound();
+        return;
+      case GetContext::kCorrupt:
+        *status = Status::Corruption("corrupted key for ", user_key);
+        return;
+      case GetContext::kUnexpectedBlobIndex:
+        ROCKS_LOG_ERROR(info_log_, "Encounter unexpected blob index.");
+        *status = Status::NotSupported(
+            "Encounter unexpected blob index. Please open DB with "
+            "ROCKSDB_NAMESPACE::blob_db::BlobDB instead.");
+        return;
+      case GetContext::kMergeOperatorFailed:
+        *status = Status::Corruption(Status::SubCode::kMergeOperatorFailed);
+        return;
+    }
+    // 没有发现对应的值则从下一个文件查找
+    f = fp.GetNextFile();
+  }
+
+  if (GetContext::kMerge == get_context.State()) {
+    // 进行合并处理
+    if (!do_merge) {
+      *status = Status::OK();
+      return;
+    }
+    if (!merge_operator_) {
+      *status = Status::InvalidArgument(
+          "merge_operator is not properly initialized.");
+      return;
+    }
+    if (value || columns) {
+      // 合并执行逻辑
+      *status = MergeHelper::TimedFullMerge(
+          merge_operator_, user_key, MergeHelper::kNoBaseValue,
+          merge_context->GetOperands(), info_log_, db_statistics_, clock_,
+          /* update_num_ops_stats */ true, /* op_failure_scope */ nullptr,
+          value ? value->GetSelf() : nullptr, columns);
+      if (status->ok()) {
+        if (LIKELY(value != nullptr)) {
+          value->PinSelf();
+        }
+      }
+    }
+  } else {
+    if (key_exists != nullptr) {
+      *key_exists = false;
+    }
+    *status = Status::NotFound();  
+  }
+}
+```
+
+这个函数会遍历所有的 level，然后再遍历每个 level 的所有的文件,这里会对 level 0 的文件做一个特殊处理，这是因为只有 level0 的 sst 的 range 不是有序的，而在非 level0，只需要按照二分查找来得到对应的文件即可，如果二分查找不存在，那么就需要进入下一个 level 查找
+
+```c++
+FdWithKeyRange* GetNextFile() {
+  while (!search_ended_) {  
+    // 第一层循环按层级高低（level0 --> 最高层）
+    while (curr_index_in_curr_level_ < curr_file_level_->num_files) {
+      // 第二层循环当前层级所有的文件
+      FdWithKeyRange* f = &curr_file_level_->files[curr_index_in_curr_level_];
+      hit_file_level_ = curr_level_;
+      is_hit_file_last_in_level_ =
+          curr_index_in_curr_level_ == curr_file_level_->num_files - 1;
+      int cmp_largest = -1;
+
+      if (num_levels_ > 1 || curr_file_level_->num_files > 3) {
+        // 总层级数大于 1 或者当前层级文件数大于 3
+
+        // 比较目标 user_key_ 与当前 SST 文件的最小键 
+        int cmp_smallest = user_comparator_->CompareWithoutTimestamp(
+            user_key_, ExtractUserKey(f->smallest_key));
+        if (cmp_smallest >= 0) {
+          // // 比较目标 user_key_ 与当前 SST 文件的最大键
+          cmp_largest = user_comparator_->CompareWithoutTimestamp(
+              user_key_, ExtractUserKey(f->largest_key));
+        }
+
+        if (curr_level_ > 0) {
+          // 根据当前层级的 key 比较结果预测下一层级的搜索范围，从而减少无效文件扫描
+          file_indexer_->GetNextLevelIndex(
+              curr_level_, curr_index_in_curr_level_, cmp_smallest,
+              cmp_largest, &search_left_bound_, &search_right_bound_);
+        }
+        if (cmp_smallest < 0 || cmp_largest > 0) {
+          if (curr_level_ == 0) {
+            // Level 0：继续查本层下一个文件
+            ++curr_index_in_curr_level_;
+            continue;
+          } else {
+            // 非Level 0：跳过本层剩余文件，直接进入下一层
+            break;
+          }
+        }
+      }
+
+      returned_file_level_ = curr_level_;
+      if (curr_level_ > 0 && cmp_largest < 0) {
+        // user_key < 当前文件最大键，无需再遍历后续文件，终止当前层搜索并跳转下一层
+        search_ended_ = !PrepareNextLevel();
+      } else {
+        ++curr_index_in_curr_level_;
+      }
+      return f;
+    }
+    // 遍历下一层
+    search_ended_ = !PrepareNextLevel();
+  }
+  return nullptr;
+}
+```
+
+**层级关联性** ： 目的解决 LSM-Tree 深层 SST 文件二分查找开销过大的问题，上层文件的键范围与下层文件存在固定映射关系
+
+在 Compaction 过程中，为每个上层文件预计算其键范围在下一层对应的 **文件索引边界**（`smallest_lb`, `largest_lb`, `smallest_rb`, `largest_rb`），建立跨层级索引，查询时根据键与当前文件范围的比较结果（`cmp_smallest`, `cmp_largest`），直接映射到下层文件的子集，避免全层二分搜索
+
+- `smallest_lb`：下层中第一个满足` largest >= 上层 smallest 的文件索引`
+- `smallest_rb`：下层中最后一个满足` smallest <= 上层.smallest 的文件索引`
+- `largest_lb`：下层中第一个满足` largest >= 上层.largest 的文件索引`
+- `largest_rb`：下层中最后一个满足` smallest <= 上层.largest 的文件索引`
+
+![indexing_sst](./images/indexing_sst.png)
+
+如图所示，当上层文件边界（如 100）落到下层文件内（如 file 3 [95, 110]）时，该边界 lb 和 rb 指针指向相同；当文件边界（如 400）落到下层文件**空隙内**（如 file 7 和 file 8 之间），lb 和 rb 才指向不同。
+
+举个例子，现在需要查找 key = 230，在 level 1 通过二分查找定位到 file 2，230 小于 smallest = 300，因此 level 1 不含有此 key 需要查找 level 2，目标键的范围在 200 到 300 之间，level 2 中不重叠的文件都可以排除，通过索引得知只有 file 5 - file 6 可能包含小于 key = 230 的键，因此最终将搜索范围从 8 个文件 缩小为 2 个文件
+
+```c++
+struct IndexUnit {
+    IndexUnit()
+        : smallest_lb(0), largest_lb(0), smallest_rb(-1), largest_rb(-1) {}
+    int32_t smallest_lb;
+    int32_t largest_lb;
+    int32_t smallest_rb;
+    int32_t largest_rb;
+  };
+
+
+void FileIndexer::GetNextLevelIndex(const size_t level, const size_t file_index,
+                                    const int cmp_smallest,
+                                    const int cmp_largest, int32_t* left_bound,
+                                    int32_t* right_bound) const {
+  assert(level > 0);
+  if (level == num_levels_ - 1) {
+     // 最后一层
+    *left_bound = 0;
+    *right_bound = -1;
+    return;
+  }
+
+  const IndexUnit* index_units = next_level_index_[level].index_units;
+  const auto& index = index_units[file_index];
+
+  if (cmp_smallest < 0) {
+    *left_bound = (level > 0 && file_index > 0)
+                      ? index_units[file_index - 1].largest_lb
+                      : 0;
+    *right_bound = index.smallest_rb;
+  } else if (cmp_smallest == 0) {
+    *left_bound = index.smallest_lb;
+    *right_bound = index.smallest_rb;
+  } else if (cmp_largest < 0) {
+    *left_bound = index.smallest_lb;
+    *right_bound = index.largest_rb;
+  } else if (cmp_largest == 0) {
+    *left_bound = index.largest_lb;
+    *right_bound = index.largest_rb;
+  } else {
+    *left_bound = index.largest_lb;
+    *right_bound = level_rb_[level + 1];
+  }
+
+}
+```
+
+
+
 #### SuperVersion
 
 SuperVersion 是管理数据版本一致性的核心机制，包含当前活跃的 **MemTable**、**Immutable MemTables** 以及磁盘上的 **SST 文件版本（Version）**，访问 SuperVersion 的成员变量线程不安全，需要锁机制保障

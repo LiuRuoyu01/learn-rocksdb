@@ -1,27 +1,8 @@
 ## 读流程
 
-RocksDB 中的读取需要处理的问题是**如何读取最新的数据**。RocksDB 是基于 LSM 树，因此在对数据进行 delete 和 update 时并不会立即执行相应的操作，而是插入一条新数据，数据的最终更新以及删除是在 compact 时执行的。
-
-获取当前列族最新的SuperVersion（包含最新的memtabe、immemtable、sst），然后按顺序分别去读memtable、immemtable、sst，只要在任何一个地方读到目标key就直接返回
-
-rocksdb在读sst文件的时候，在L0层需要遍历所有的SST文件（因为L0的sst文件不是严格有序的），L1开始就采用二分的方式去读
+RocksDB 中的读取需要处理的问题是**如何读取最新的数据**。RocksDB 是基于 LSM 树，因此在对数据进行 delete 和 update 时并不会立即执行相应的操作，而是插入一条新数据，数据的最终更新以及删除是在 compact 时执行的。RocksDB 按顺序分别去读memtable、immemtable、sst，只要在任何一个地方读到目标key就直接返回，在读sst文件的时候，在L0层需要遍历所有的SST文件（因为L0的sst文件不是严格有序的），L1开始就采用二分的方式去读
 
 ```c++
-virtual Status Get(const ReadOptions& options, const Slice& key,
-                     std::string* value) final {
-  // 从默认列族读
-  return Get(options, DefaultColumnFamily(), key, value);
-}
-
-virtual inline Status Get(const ReadOptions& options,
-                            ColumnFamilyHandle* column_family, const Slice& key,
-                            std::string* value) final {
-  // 这里用 PinnableSlice 类型的字符串，内部读取的时候减少拷贝
-  PinnableSlice pinnable_val(value);
-  auto s = Get(options, column_family, key, &pinnable_val);
-  ...
-}
-
 Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
                        GetImplOptions& get_impl_options) {
   // ...
@@ -243,7 +224,8 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
               get_impl_options.merge_operands->PinSlice(
                   sl, nullptr /* cleanable */);
               if (i == state->merge_context.GetOperands().size() - 1) {
-                // 如果是最后一个操作数，将资源清理的责任完全转移给最后一个操作数关联的 cleanable 对象，当最后一个操作数被用户释放时，其 Cleanable 链自动执行清理回调
+                // 如果是最后一个操作数，将资源清理的责任完全转移给最后一个操作数关联的 cleanable 对象
+                // 当最后一个操作数被用户释放时，其 Cleanable 链自动执行清理回调
                 shared_cleanable.MoveAsCleanupTo( get_impl_options.merge_operands);
               } else {
                 // 非最后一个操作数，复制清理逻辑到当前操作数关联的 cleanable，确保每个操作数释放时都能独立出发资源回收
@@ -274,7 +256,7 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
 }
 ```
 
-在 [memtable](../ch02/RocksDB_MemTable.md) 和 [sst](../ch02/RocksDB_SST.md) 的章节中对具体的 Get 操作有相关介绍
+在 [memtable](../ch02/RocksDB_MemTable.md) 和 [version](../ch03/RocksDB_Version.md) 的章节中对具体的 Get 操作有相关介绍
 
 
 
