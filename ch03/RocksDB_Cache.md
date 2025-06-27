@@ -1,4 +1,4 @@
-## 块缓存
+## Block Cache
 
 Block Cache 是 RocksDB 用于 **读操作** 的内存缓存，存储了从 SST 文件中读取的未压缩数据块，减少了对磁盘的访问
 
@@ -595,6 +595,279 @@ inline FixedHyperClockTable::HandleImpl* FixedHyperClockTable::FindSlot(
   } while (!is_last);
 
   return nullptr;
+}
+
+```
+
+
+
+# Table Cache
+
+Table Cache 通过 Row Cache （热点数据直接存在内存中）和 Table Reader （将已打开的 SST 文件的数据缓存在内存中）平衡内存和磁盘的访问，解决 I/O 瓶颈
+
+**Row Cache --> Table Cache --> Block Cache**
+
+```c++
+// options                            : 本次读取的策略
+// internal_comparator                : internal_key 的比较逻辑
+// file_meta                          : SST 文件的元数据
+// k                                  : 需要读取的 key
+// skip_filters                       : 是否跳过加载布隆过滤器
+// level                              : 标识 SST 文件所存在的 LSM 层级
+// max_file_size_for_l0_meta_pin      : 限制 L0 层文件元数据常驻内存大小
+Status TableCache::Get(const ReadOptions& options,
+                       const InternalKeyComparator& internal_comparator,
+                       const FileMetaData& file_meta, const Slice& k,
+                       GetContext* get_context,
+                       const MutableCFOptions& mutable_cf_options,
+                       HistogramImpl* file_read_hist, bool skip_filters,
+                       int level, size_t max_file_size_for_l0_meta_pin) {
+  auto& fd = file_meta.fd;
+  std::string* row_cache_entry = nullptr;
+  bool done = false;
+  IterKey row_cache_key;
+  std::string row_cache_entry_buffer;
+
+  Status s;
+  if (ioptions_.row_cache && !get_context->NeedToReadSequence()) {
+    // row cahce 存储数据的最新版本，不包含历史版本
+    auto user_key = ExtractUserKey(k);
+    // 构造 Row Cache Key（[row_cache_id][fd_number][cache_entry_seq_no]）
+    uint64_t cache_entry_seq_no =
+        CreateRowCacheKeyPrefix(options, fd, k, get_context, row_cache_key);
+    // 从 raw cache 读取数据
+    done = GetFromRowCache(user_key, row_cache_key, row_cache_key.Size(),
+                           get_context, &s, cache_entry_seq_no);
+    if (!done) {
+      row_cache_entry = &row_cache_entry_buffer;
+    }
+  }
+  TableReader* t = fd.table_reader;
+  TypedHandle* handle = nullptr;
+  if (s.ok() && !done) {
+    // row cache 未命中则开始查找 Table cache
+    if (t == nullptr) {
+      // 调用 FindTable 查找 SST 文件的元数据
+      s = FindTable(options, file_options_, internal_comparator, file_meta,
+                    &handle, mutable_cf_options,
+                    options.read_tier == kBlockCacheTier /* no_io */,
+                    file_read_hist, skip_filters, level,
+                    true /* prefetch_index_and_filter_in_cache */,
+                    max_file_size_for_l0_meta_pin, file_meta.temperature);
+      if (s.ok()) {
+        t = cache_.Value(handle);
+      }
+    }
+    SequenceNumber* max_covering_tombstone_seq =
+        get_context->max_covering_tombstone_seq();
+    if (s.ok() && max_covering_tombstone_seq != nullptr &&
+        !options.ignore_range_deletions) {
+      // 创建 Range Tombstone 迭代器
+      std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
+          t->NewRangeTombstoneIterator(options));
+      if (range_del_iter != nullptr) {
+        // 检查 Key 是否被 Tombstone 覆盖
+        SequenceNumber seq =
+            range_del_iter->MaxCoveringTombstoneSeqnum(ExtractUserKey(k));
+        if (seq > *max_covering_tombstone_seq) {
+          // 如果覆盖当前 Key 的最大 Tombstone 序列号大于 max_covering_tombstone_seq 则更新
+          // 以便后续若发现 Key 的序列号小于此值，说明 Key 已被删除，提前终止查询
+          *max_covering_tombstone_seq = seq;
+          if (get_context->NeedTimestamp()) {
+            get_context->SetTimestampFromRangeTombstone(
+                range_del_iter->timestamp());
+          }
+        }
+      }
+    }
+    if (s.ok()) {
+      // 后续复用 Get 得到的值 insert 到 raw cache 中，无需重复查询
+      get_context->SetReplayLog(row_cache_entry);  // nullptr if no cache.
+      // 执行 SST 文件查询
+      s = t->Get(options, k, get_context,
+                 mutable_cf_options.prefix_extractor.get(), skip_filters);
+      get_context->SetReplayLog(nullptr);
+    } else if (options.read_tier == kBlockCacheTier && s.IsIncomplete()) {
+      // 如果仅支持内存模式，标记 key 可能存在
+      get_context->MarkKeyMayExist();
+      done = true;
+    }
+  }
+
+  if (!done && s.ok() && row_cache_entry && !row_cache_entry->empty()) {
+    RowCacheInterface row_cache{ioptions_.row_cache.get()};
+    size_t charge = row_cache_entry->capacity() + sizeof(std::string);
+    auto row_ptr = new std::string(std::move(*row_cache_entry));
+    // 数据插入 row cache
+    Status rcs = row_cache.Insert(row_cache_key.GetUserKey(), row_ptr, charge);
+    if (!rcs.ok()) {
+      delete row_ptr;
+    }
+  }
+
+  if (handle != nullptr) {
+    cache_.Release(handle);
+  }
+  return s;
+}
+
+// 从 row cache 查询缓存
+bool TableCache::GetFromRowCache(const Slice& user_key, IterKey& row_cache_key,
+                                 size_t prefix_size, GetContext* get_context,
+                                 Status* read_status, SequenceNumber seq_no) {
+  bool found = false;
+  // 生成 key
+  row_cache_key.TrimAppend(prefix_size, user_key.data(), user_key.size());
+  RowCacheInterface row_cache{ioptions_.row_cache.get()};
+  if (auto row_handle = row_cache.Lookup(row_cache_key.GetUserKey())) {
+    // 通过 cleanable 实现自动释放资源避免泄漏，读流程中有详细介绍
+    Cleanable value_pinner;
+    // 将 row_handle 的 Release() 操作注册清理任务
+    row_cache.RegisterReleaseAsCleanup(row_handle, value_pinner);
+    // 解析 cache 缓存的序列化结果并放到 get_context 里
+    *read_status = replayGetContextLog(*row_cache.Value(row_handle), user_key,
+                                       get_context, &value_pinner, seq_no);
+    found = true;
+  } 
+  return found;
+}
+
+
+// ReadOptions                        : 本次读取的策略
+// file_options                       : SST 文件的 I/O 行为
+// internal_comparator                : internal_key 的比较逻辑
+// file_meta                          : SST 文件的元数据
+// no_io                              : 是否禁止磁盘 I/O
+// skip_filters                       : 是否跳过加载布隆过滤器
+// level                              : 标识 SST 文件所存在的 LSM 层级
+// prefetch_index_and_filter_in_cache : 是否预取索引和布隆过滤器到 BlockCache
+// max_file_size_for_l0_meta_pin      : 限制 L0 层文件元数据常驻内存大小
+// file_temperature                   : 标识文件数据冷热
+Status TableCache::FindTable(
+    const ReadOptions& ro, const FileOptions& file_options,
+    const InternalKeyComparator& internal_comparator,
+    const FileMetaData& file_meta, TypedHandle** handle,
+    const MutableCFOptions& mutable_cf_options, const bool no_io,
+    HistogramImpl* file_read_hist, bool skip_filters, int level,
+    bool prefetch_index_and_filter_in_cache,
+    size_t max_file_size_for_l0_meta_pin, Temperature file_temperature) {
+
+  // 提取文件的编号作为 LRU 缓存的键
+  uint64_t number = file_meta.fd.GetNumber();
+  Slice key = GetSliceForFileNumber(&number);
+  // 首次查找缓存
+  *handle = cache_.Lookup(key);
+
+  if (*handle == nullptr) {
+    if (no_io) {
+      // 避免触发磁盘操作，避免干扰其他线程的 I/O 操作。
+      return Status::Incomplete("Table not found in table_cache, no_io is set");
+    }
+    // 加锁（按 key 的哈希分片）二次检查
+    MutexLock load_lock(&loader_mutex_.Get(key));
+    *handle = cache_.Lookup(key);
+    if (*handle != nullptr) {
+      return Status::OK();
+    }
+
+    // 调用 GetTableReader 加载 SST 文件
+    std::unique_ptr<TableReader> table_reader;
+    Status s = GetTableReader(ro, file_options, internal_comparator, file_meta,
+                              false /* sequential mode */, file_read_hist,
+                              &table_reader, mutable_cf_options, skip_filters,
+                              level, prefetch_index_and_filter_in_cache,
+                              max_file_size_for_l0_meta_pin, file_temperature);
+    if (!s.ok()) {
+      assert(table_reader == nullptr);
+    } else {
+      // 将 table_reader 插入缓存，并把所有权转移给缓存，通过 handle 进行后续的访问
+      s = cache_.Insert(key, table_reader.get(), 1, handle);
+      if (s.ok()) {
+        table_reader.release();
+      }
+    }
+    return s;
+  }
+  return Status::OK();
+}
+
+Status TableCache::GetTableReader(
+    const ReadOptions& ro, const FileOptions& file_options,
+    const InternalKeyComparator& internal_comparator,
+    const FileMetaData& file_meta, bool sequential_mode,
+    HistogramImpl* file_read_hist, std::unique_ptr<TableReader>* table_reader,
+    const MutableCFOptions& mutable_cf_options, bool skip_filters, int level,
+    bool prefetch_index_and_filter_in_cache,
+    size_t max_file_size_for_l0_meta_pin, Temperature file_temperature) {
+  // 生成 SST 文件路径
+  std::string fname = TableFileName(
+      ioptions_.cf_paths, file_meta.fd.GetNumber(), file_meta.fd.GetPathId());
+  
+  // 创建 FSRandomAccessFile 进行文件读取
+  std::unique_ptr<FSRandomAccessFile> file;
+  FileOptions fopts = file_options;
+  fopts.temperature = file_temperature;
+  Status s = PrepareIOFromReadOptions(ro, ioptions_.clock, fopts.io_options);
+  if (s.ok()) {
+    s = ioptions_.fs->NewRandomAccessFile(fname, fopts, &file, nullptr);
+  }
+  if (s.ok()) {
+    RecordTick(ioptions_.stats, NO_FILE_OPENS);
+  } else if (s.IsPathNotFound()) {
+    // 如果文件不存在则将 rocksdb 格式替换为 leveldb 进行兼容
+    fname = Rocks2LevelTableFileName(fname);
+    Status temp_s =
+        PrepareIOFromReadOptions(ro, ioptions_.clock, fopts.io_options);
+    if (temp_s.ok()) {
+      temp_s = ioptions_.fs->NewRandomAccessFile(fname, file_options, &file,
+                                                 nullptr);
+    }
+    if (temp_s.ok()) {
+      s = temp_s;
+    }
+  }
+
+  if (s.ok()) { 
+    if (!sequential_mode && ioptions_.advise_random_on_open) {
+      // 非顺序扫描通知操作系统尽职 prefetch 减少读放大
+      file->Hint(FSRandomAccessFile::kRandom);
+    }
+    if (ioptions_.default_temperature != Temperature::kUnknown &&
+        file_temperature == Temperature::kUnknown) {
+      // 冷热数据分层处理
+      file_temperature = ioptions_.default_temperature;
+    }
+
+    std::unique_ptr<RandomAccessFileReader> file_reader(
+        new RandomAccessFileReader(std::move(file), fname, ioptions_.clock,
+                                   io_tracer_, ioptions_.stats, SST_READ_MICROS,
+                                   file_read_hist, ioptions_.rate_limiter.get(),
+                                   ioptions_.listeners, file_temperature,
+                                   level == ioptions_.num_levels - 1));
+    
+    // SST 文件校验
+    UniqueId64x2 expected_unique_id;
+    if (ioptions_.verify_sst_unique_id_in_manifest) {
+      expected_unique_id = file_meta.unique_id;
+    } else {
+      expected_unique_id = kNullUniqueId64x2;  // null ID == no verification
+    }
+    // TableReader 创建，元数据加载
+    s = mutable_cf_options.table_factory->NewTableReader(
+        ro,
+        TableReaderOptions(
+            ioptions_, mutable_cf_options.prefix_extractor, file_options,
+            internal_comparator,
+            mutable_cf_options.block_protection_bytes_per_key, skip_filters,
+            immortal_tables_, false /* force_direct_prefetch */, level,
+            block_cache_tracer_, max_file_size_for_l0_meta_pin, db_session_id_,
+            file_meta.fd.GetNumber(), expected_unique_id,
+            file_meta.fd.largest_seqno, file_meta.tail_size,
+            file_meta.user_defined_timestamps_persisted),
+        std::move(file_reader), file_meta.fd.GetFileSize(), table_reader,
+        prefetch_index_and_filter_in_cache);
+  }
+  return s;
 }
 
 ```
