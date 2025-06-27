@@ -162,6 +162,161 @@ uint64_t current_version_number_;
 }
 ```
 
+#### Get 操作
+
+```c++
+void Version::Get(const ReadOptions& read_options, const LookupKey& k,
+                  PinnableSlice* value, PinnableWideColumns* columns,
+                  std::string* timestamp, Status* status,
+                  MergeContext* merge_context,
+                  SequenceNumber* max_covering_tombstone_seq,
+                  PinnedIteratorsManager* pinned_iters_mgr, bool* value_found,
+                  bool* key_exists, SequenceNumber* seq, ReadCallback* callback,
+                  bool* is_blob, bool do_merge) {
+  Slice ikey = k.internal_key();
+  Slice user_key = k.user_key();
+
+  if (key_exists != nullptr) {
+    *key_exists = true;
+  }
+
+  // KV 分离架构，后续 compaction 章节有介绍
+  // 旧版 blob_index 通过外部参数 is_blob 显示标记，新版内部支持原生的 blob_index，通过 value 类型进行隐式识别
+  bool is_blob_index = false;
+  bool* const is_blob_to_use = is_blob ? is_blob : &is_blob_index;
+  // 初始化 blob 数据读取
+  BlobFetcher blob_fetcher(this, read_options);
+
+  GetContext get_context(
+      user_comparator(), merge_operator_, info_log_, db_statistics_,
+      status->ok() ? GetContext::kNotFound : GetContext::kMerge, user_key,
+      do_merge ? value : nullptr, do_merge ? columns : nullptr,
+      do_merge ? timestamp : nullptr, value_found, merge_context, do_merge,
+      max_covering_tombstone_seq, clock_, seq,
+      merge_operator_ ? pinned_iters_mgr : nullptr, callback, is_blob_to_use,
+      tracing_get_id, &blob_fetcher);
+
+  // merge 操作锁定 block 防止提前释放数据块
+  if (merge_operator_) {
+    pinned_iters_mgr->StartPinning();
+  }
+
+  // 初始化 FilePicker，根据 key 定位文件
+  FilePicker fp(user_key, ikey, &storage_info_.level_files_brief_,
+                storage_info_.num_non_empty_levels_,
+                &storage_info_.file_indexer_, user_comparator(),
+                internal_comparator());
+  FdWithKeyRange* f = fp.GetNextFile();
+
+  while (f != nullptr) {
+    if (*max_covering_tombstone_seq > 0) {
+      // 在一个比当前查询目标 Key 更新的删除操作
+      break;
+    }
+  
+    // 从 tablecache 中查询 Key 可能所在的 SST 文件及具体数据块，在 cache 章节有详细解析
+    *status = table_cache_->Get(
+        read_options, *internal_comparator(), *f->file_metadata, ikey,
+        &get_context, mutable_cf_options_,
+        cfd_->internal_stats()->GetFileReadHist(fp.GetHitFileLevel()),
+        IsFilterSkipped(static_cast<int>(fp.GetHitFileLevel()),
+                        fp.IsHitFileLastInLevel()),
+        fp.GetHitFileLevel(), max_file_size_for_l0_meta_pin_);
+
+    if (!status->ok()) {
+      return;
+    }
+
+    switch (get_context.State()) {
+      case GetContext::kNotFound:
+        break;
+      case GetContext::kMerge:
+        break;
+      case GetContext::kFound:
+        if (is_blob_index && do_merge && (value || columns)) {
+          // 获取 blob 索引数据
+          Slice blob_index =
+              value ? *value
+                    : WideColumnsHelper::GetDefaultColumn(columns->columns());
+
+          constexpr FilePrefetchBuffer* prefetch_buffer = nullptr;
+
+          // 加载 blob 数据
+          PinnableSlice result;
+          constexpr uint64_t* bytes_read = nullptr;
+          *status = GetBlob(read_options, get_context.ukey_to_get_blob_value(),
+                            blob_index, prefetch_buffer, &result, bytes_read);
+          if (!status->ok()) {
+            if (status->IsIncomplete()) {
+              get_context.MarkKeyMayExist();
+            }
+            return;
+          }
+
+          if (value) {
+            *value = std::move(result);
+          } else {
+            assert(columns);
+            columns->SetPlainValue(std::move(result));
+          }
+        }
+
+        return;
+      case GetContext::kDeleted:
+        *status = Status::NotFound();
+        return;
+      case GetContext::kCorrupt:
+        *status = Status::Corruption("corrupted key for ", user_key);
+        return;
+      case GetContext::kUnexpectedBlobIndex:
+        ROCKS_LOG_ERROR(info_log_, "Encounter unexpected blob index.");
+        *status = Status::NotSupported(
+            "Encounter unexpected blob index. Please open DB with "
+            "ROCKSDB_NAMESPACE::blob_db::BlobDB instead.");
+        return;
+      case GetContext::kMergeOperatorFailed:
+        *status = Status::Corruption(Status::SubCode::kMergeOperatorFailed);
+        return;
+    }
+    // 没有发现对应的值则从下一个文件查找
+    f = fp.GetNextFile();
+  }
+
+  if (GetContext::kMerge == get_context.State()) {
+    // 进行合并处理
+    if (!do_merge) {
+      *status = Status::OK();
+      return;
+    }
+    if (!merge_operator_) {
+      *status = Status::InvalidArgument(
+          "merge_operator is not properly initialized.");
+      return;
+    }
+    if (value || columns) {
+      // 合并执行逻辑
+      *status = MergeHelper::TimedFullMerge(
+          merge_operator_, user_key, MergeHelper::kNoBaseValue,
+          merge_context->GetOperands(), info_log_, db_statistics_, clock_,
+          /* update_num_ops_stats */ true, /* op_failure_scope */ nullptr,
+          value ? value->GetSelf() : nullptr, columns);
+      if (status->ok()) {
+        if (LIKELY(value != nullptr)) {
+          value->PinSelf();
+        }
+      }
+    }
+  } else {
+    if (key_exists != nullptr) {
+      *key_exists = false;
+    }
+    *status = Status::NotFound();  
+  }
+}
+```
+
+
+
 #### SuperVersion
 
 SuperVersion 是管理数据版本一致性的核心机制，包含当前活跃的 **MemTable**、**Immutable MemTables** 以及磁盘上的 **SST 文件版本（Version）**，访问 SuperVersion 的成员变量线程不安全，需要锁机制保障
