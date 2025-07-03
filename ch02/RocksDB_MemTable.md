@@ -458,3 +458,151 @@ InlineSkipList<Comparator>::AllocateNode(size_t key_size, int height) {
 }
 ```
 
+##### Add 操作
+
+```c++
+template <class Comparator>
+template <bool UseCAS>
+bool InlineSkipList<Comparator>::Insert(const char* key, Splice* splice,
+                                        bool allow_partial_splice_fix) {
+  Node* x = reinterpret_cast<Node*>(const_cast<char*>(key)) - 1;
+  const DecodedKey key_decoded = compare_.decode_key(key);
+  // 节点在完全插入跳表前不可被其他线程访问。借用 next_[0] 暂存高度，避免未初始化完成时被误读指针
+  int height = x->UnstashHeight();
+  assert(height >= 1 && height <= kMaxHeight_);
+
+  int max_height = max_height_.load(std::memory_order_relaxed);
+  while (height > max_height) {
+    if (max_height_.compare_exchange_weak(max_height, height)) {
+      // cas 更新全局最大高度
+      max_height = height;
+      break;
+    }
+  }
+  assert(max_height <= kMaxPossibleHeight);
+
+  // splice 记录了前驱和后继节点，用于加速插入路径定位
+  int recompute_height = 0;
+  if (splice->height_ < max_height) {
+    // Splice 缓存的层级低于当前跳表高度时，初始化 Splice 最高层指向头节点 head_，需全部重新计算
+    splice->prev_[max_height] = head_;
+    splice->next_[max_height] = nullptr;
+    splice->height_ = max_height;
+    recompute_height = max_height;
+  } else {
+    while (recompute_height < max_height) {
+      if (splice->prev_[recompute_height]->Next(recompute_height) !=
+          splice->next_[recompute_height]) {
+        // 有其他线程插入新节点
+        ++recompute_height;
+      } else if (splice->prev_[recompute_height] != head_ &&
+                 !KeyIsAfterNode(key_decoded,
+                                 splice->prev_[recompute_height])) {
+        // key 在 splice 的前面
+        if (allow_partial_splice_fix) {
+          // 跳过连续失效层
+          Node* bad = splice->prev_[recompute_height];
+          while (splice->prev_[recompute_height] == bad) {
+            ++recompute_height;
+          }
+        } else {
+          // splice 需要全量重算
+          recompute_height = max_height;
+        }
+      } else if (KeyIsAfterNode(key_decoded, splice->next_[recompute_height])) {
+        // key 在 splice 的后面
+        if (allow_partial_splice_fix) {
+          Node* bad = splice->next_[recompute_height];
+          while (splice->next_[recompute_height] == bad) {
+            ++recompute_height;
+          }
+        } else {
+          recompute_height = max_height;
+        }
+      } else {
+        break;
+      }
+    }
+  }
+  assert(recompute_height <= max_height);
+  if (recompute_height > 0) {
+    // 实际上就是调用 FindSpliceForLevel 全量计算 splice
+    RecomputeSpliceLevels(key_decoded, splice, recompute_height);
+  }
+
+  bool splice_is_valid = true;
+  if (UseCAS) {
+    for (int i = 0; i < height; ++i) {
+      while (true) {
+        // 非原子性设置节点的后继指针
+        x->NoBarrier_SetNext(i, splice->next_[i]);
+        if (splice->prev_[i]->CASNext(i, splice->next_[i], x)) {
+          // 通过 CAS 将链表连起来，将前驱节点的后继节点换成当前的节点
+          break;
+        }
+        // CAS 失败，更新 splice
+        FindSpliceForLevel<false>(key_decoded, splice->prev_[i], nullptr, i,
+                                  &splice->prev_[i], &splice->next_[i]);
+
+        if (i > 0) {
+          // 高层节点的键范围必须严格包含低层范围，如果当前层 > 0，影响后续插入，标记 splice 全局失效，全局修复
+          splice_is_valid = false;
+        }
+      }
+    }
+  } else {
+    for (int i = 0; i < height; ++i) {
+      if (i >= recompute_height &&
+          splice->prev_[i]->Next(i) != splice->next_[i]) {
+        // 更新 splice
+        FindSpliceForLevel<false>(key_decoded, splice->prev_[i], nullptr, i,
+                                  &splice->prev_[i], &splice->next_[i]);
+      }
+      
+      // 将节点插入进去
+      x->NoBarrier_SetNext(i, splice->next_[i]);
+      splice->prev_[i]->SetNext(i, x);
+    }
+  }
+  if (splice_is_valid) {
+    for (int i = 0; i < height; ++i) {
+      // 更新 splice，连接前驱当前节点
+      splice->prev_[i] = x;
+    }
+  } else {
+    splice->height_ = 0;
+  }
+  return true;
+}
+
+template <class Comparator>
+template <bool prefetch_before>
+void InlineSkipList<Comparator>::FindSpliceForLevel(const DecodedKey& key,
+                                                    Node* before, Node* after,
+                                                    int level, Node** out_prev,
+                                                    Node** out_next) {
+  while (true) {
+    Node* next = before->Next(level);
+    if (next != nullptr) {
+      // 预取同层下一个节点
+      PREFETCH(next->Next(level), 0, 1);
+    }
+    if (prefetch_before == true) {
+      if (next != nullptr && level > 0) {
+        PREFETCH(next->Next(level - 1), 0, 1);
+      }
+    }
+    assert(before == head_ || next == nullptr ||
+           KeyIsAfterNode(next->Key(), before));
+    assert(before == head_ || KeyIsAfterNode(key, before));
+    if (next == after || !KeyIsAfterNode(key, next)) {
+      // 找到第一个 key > next 的节点信息，将 next 作为 splice 的 next，before 作为 pre
+      *out_prev = before;
+      *out_next = next;
+      return;
+    }
+    before = next;
+  }
+}
+```
+
