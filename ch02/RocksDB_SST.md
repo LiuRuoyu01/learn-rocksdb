@@ -302,4 +302,143 @@ Flag:
 
 
 
-SST 文件的 Get 操作请在 [version](../ch03/RocksDB_Version.md) 中查看
+##### Get 操作
+
+```c++
+Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
+                            GetContext* get_context,
+                            const SliceTransform* prefix_extractor,
+                            bool skip_filters) {
+  // 时间戳过滤
+  if (!TimestampMayMatch(read_options)) {
+    return Status::OK();
+  }
+  
+  Status s;
+
+  // 初始化 bloom filter
+  FilterBlockReader* const filter =
+      !skip_filters ? rep_->filter.get() : nullptr;
+
+  // ...
+  
+  // 通过 bllom filter 判断键是否可能存在 
+  const bool may_match =
+      FullFilterKeyMayMatch(filter, key, prefix_extractor, get_context,
+                            &lookup_context, read_options);
+
+  if (may_match) {
+    // 创建指向 SST 索引的迭代器
+    IndexBlockIter iiter_on_stack;
+    bool need_upper_bound_check = false;
+    if (rep_->index_type == BlockBasedTableOptions::kHashSearch) {
+      need_upper_bound_check = PrefixExtractorChanged(prefix_extractor);
+    }
+    auto iiter =
+        NewIndexIterator(read_options, need_upper_bound_check, &iiter_on_stack,
+                         get_context, &lookup_context);
+    std::unique_ptr<InternalIteratorBase<IndexValue>> iiter_unique_ptr;
+    if (iiter != &iiter_on_stack) {
+      iiter_unique_ptr.reset(iiter);
+    }
+
+    size_t ts_sz =
+        rep_->internal_comparator.user_comparator()->timestamp_size();
+    // 标记是否找到匹配键
+    bool matched = false;  
+    // 控制循环终止（找到键或确认不存在时置true）
+    bool done = false;
+    for (iiter->Seek(key); iiter->Valid() && !done; iiter->Next()) {
+      IndexValue v = iiter->value();
+      if (!v.first_internal_key.empty() && !skip_filters &&
+          UserComparatorWrapper(rep_->internal_comparator.user_comparator())
+                  .CompareWithoutTimestamp(
+                      ExtractUserKey(key),
+                      ExtractUserKey(v.first_internal_key)) < 0) {
+        // 如果 key 位于前一个 block 的最高 key 和当前 block 的最低 key 之间，说明目标 key 不存在 
+        break;
+      }
+      BlockCacheLookupContext lookup_data_block_context{
+          TableReaderCaller::kUserGet, tracing_get_id,
+          /*get_from_user_specified_snapshot=*/read_options.snapshot !=
+              nullptr};
+      bool does_referenced_key_exist = false;
+      
+      // 创建数据块的迭代器
+      DataBlockIter biter;
+      uint64_t referenced_data_size = 0;
+      Status tmp_status;
+      NewDataBlockIterator<DataBlockIter>(
+          read_options, v.handle, &biter, BlockType::kData, get_context,
+          &lookup_data_block_context, /*prefetch_buffer=*/nullptr,
+          /*for_compaction=*/false, /*async_read=*/false, tmp_status,
+          /*use_block_cache_for_lookup=*/true);
+
+      if (read_options.read_tier == kBlockCacheTier &&
+          biter.status().IsIncomplete()) {
+        // read_tier 为仅从 block cache 中读取且未命中，标记为可能存在
+        get_context->MarkKeyMayExist();
+        s = biter.status();
+        break;
+      }
+      if (!biter.status().ok()) {
+        s = biter.status();
+        break;
+      }
+
+      // 使用内部 hash index 快速判断键是否存在
+      bool may_exist = biter.SeekForGet(key);
+      if (!may_exist && ts_sz == 0) {
+        done = true;
+      } else {
+        // 遍历 Data Block 中的所有键值对
+        for (; biter.Valid(); biter.Next()) {
+          ParsedInternalKey parsed_key;
+          Status pik_status = ParseInternalKey(
+              biter.key(), &parsed_key, false /* log_err_key */);  // TODO
+          if (!pik_status.ok()) {
+            s = pik_status;
+            break;
+          }
+
+          Status read_status;
+          bool ret = get_context->SaveValue(
+              parsed_key, biter.value(), &matched, &read_status,
+              biter.IsValuePinned() ? &biter : nullptr);
+          if (!read_status.ok()) {
+            s = read_status;
+            break;
+          }
+          if (!ret) {
+            if (get_context->State() == GetContext::GetState::kFound) {
+              does_referenced_key_exist = true;
+              referenced_data_size = biter.key().size() + biter.value().size();
+            }
+            done = true;
+            break;
+          }
+        }
+        if (s.ok()) {
+          s = biter.status();
+        }
+        if (!s.ok()) {
+          break;
+        }
+      }
+ 
+      if (done) {
+        break;
+      }
+    }
+
+    if (s.ok() && !iiter->status().IsNotFound()) {
+      s = iiter->status();
+    }
+  }
+
+  return s;
+}
+
+```
+
+**详见 [BlockCache](https://github.com/LiuRuoyu01/learn-rocksdb/blob/main/ch03/RocksDB_Cache.md#block-cache) 章节和 [BloomFilter](../ch03/RocksDB_BloomFilter.md) 章节对相关内容的介绍**

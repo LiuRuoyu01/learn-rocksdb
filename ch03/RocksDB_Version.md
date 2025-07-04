@@ -162,6 +162,8 @@ uint64_t current_version_number_;
 }
 ```
 
+
+
 #### Get 操作
 
 ```c++
@@ -315,7 +317,9 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
 }
 ```
 
-这个函数会遍历所有的 level，然后再遍历每个 level 的所有的文件,这里会对 level 0 的文件做一个特殊处理，这是因为只有 level0 的 sst 的 range 不是有序的，而在非 level0，只需要按照二分查找来得到对应的文件即可，如果二分查找不存在，那么就需要进入下一个 level 查找
+**table cache 的 操作详见 [Cache章节](https://github.com/LiuRuoyu01/learn-rocksdb/blob/main/ch03/RocksDB_Cache.md#table-cache)**
+
+`GetNextFile` 函数会遍历所有的 level，然后再遍历每个 level 的所有的文件,这里会对 level 0 的文件做一个特殊处理，这是因为只有 level0 的 sst 的 range 不是有序的，而在非 level0，只需要按照二分查找来得到对应的文件即可，如果二分查找不存在，那么就需要进入下一个 level 查找
 
 ```c++
 FdWithKeyRange* GetNextFile() {
@@ -526,6 +530,8 @@ void ColumnFamilyData::ResetThreadLocalSuperVersions() {
 }
 ```
 
+
+
 ##### ThreadLocalPtr
 
 TLS 全称为 Thread-Local-Storage，也就是线程私有存储。每个线程有一个私有的存储区域，通过 key 来索引。当线程访问 TLS 变量时，实际上是通过 key 获取自己线程内的数据，是允许**多线程程序中的每个线程拥有独立数据副本**的机制，解决了多线程环境下全局变量或静态变量的共享冲突问题。
@@ -610,6 +616,8 @@ void ThreadLocalPtr::StaticMeta::Scrape(uint32_t id, autovector<void*>* ptrs,
 ThreadData 对象用于一个元素类型为 Entry 的 vector，vector 保存所有线程对应的原子指针列表，每次定义的 ThreadLocalPtr 对象都有一个 id，该 id 对应于 entries 的索引，所以当需要获取一个 ThreadLocalPtr 的数据时，只需要通过 ThreadData::entries[id] 获取。
 
 每个线程有一个线程局部变量 ThreadData，里面包含了一组指针，用于指向不同 ThreadLocalPtr 对象指向的数据。另外，ThreadData 之间相互通过指针串联起来，所有线程的 TLS 变量可以被一个线程清空或者重置。
+
+
 
 #### VersionEdit
 

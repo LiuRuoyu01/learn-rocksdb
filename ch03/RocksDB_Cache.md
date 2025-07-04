@@ -603,9 +603,40 @@ inline FixedHyperClockTable::HandleImpl* FixedHyperClockTable::FindSlot(
 
 # Table Cache
 
-Table Cache 通过 Row Cache （热点数据直接存在内存中）和 Table Reader （将已打开的 SST 文件的数据缓存在内存中）平衡内存和磁盘的访问，解决 I/O 瓶颈
+Table Cache 通过 Row Cache （热点数据直接存在内存中）和 Table Reader （文件的 meta 信息和 Foot 信息）平衡内存和磁盘的访问
 
-**Row Cache --> Table Cache --> Block Cache**
+![Get](./images/TableCacheGet.png)
+
+#### Row Cache
+
+```c++
+// 从 row cache 查询缓存
+bool TableCache::GetFromRowCache(const Slice& user_key, IterKey& row_cache_key,
+                                 size_t prefix_size, GetContext* get_context,
+                                 Status* read_status, SequenceNumber seq_no) {
+  bool found = false;
+  // 生成 key
+  row_cache_key.TrimAppend(prefix_size, user_key.data(), user_key.size());
+  RowCacheInterface row_cache{ioptions_.row_cache.get()};
+  if (auto row_handle = row_cache.Lookup(row_cache_key.GetUserKey())) {
+    // 通过 cleanable 实现自动释放资源避免泄漏，读流程中有详细介绍
+    Cleanable value_pinner;
+    // 将 row_handle 的 Release() 操作注册清理任务
+    row_cache.RegisterReleaseAsCleanup(row_handle, value_pinner);
+    // 解析 cache 缓存的序列化结果并放到 get_context 里
+    *read_status = replayGetContextLog(*row_cache.Value(row_handle), user_key,
+                                       get_context, &value_pinner, seq_no);
+    found = true;
+  } 
+  return found;
+}
+```
+
+
+
+#### Table Cache
+
+##### Get 操作
 
 ```c++
 // options                            : 本次读取的策略
@@ -683,7 +714,7 @@ Status TableCache::Get(const ReadOptions& options,
     if (s.ok()) {
       // 后续复用 Get 得到的值 insert 到 raw cache 中，无需重复查询
       get_context->SetReplayLog(row_cache_entry);  // nullptr if no cache.
-      // 执行 SST 文件查询
+      // 利用获取到的 reader 执行 SST 文件查询
       s = t->Get(options, k, get_context,
                  mutable_cf_options.prefix_extractor.get(), skip_filters);
       get_context->SetReplayLog(nullptr);
@@ -711,28 +742,14 @@ Status TableCache::Get(const ReadOptions& options,
   return s;
 }
 
-// 从 row cache 查询缓存
-bool TableCache::GetFromRowCache(const Slice& user_key, IterKey& row_cache_key,
-                                 size_t prefix_size, GetContext* get_context,
-                                 Status* read_status, SequenceNumber seq_no) {
-  bool found = false;
-  // 生成 key
-  row_cache_key.TrimAppend(prefix_size, user_key.data(), user_key.size());
-  RowCacheInterface row_cache{ioptions_.row_cache.get()};
-  if (auto row_handle = row_cache.Lookup(row_cache_key.GetUserKey())) {
-    // 通过 cleanable 实现自动释放资源避免泄漏，读流程中有详细介绍
-    Cleanable value_pinner;
-    // 将 row_handle 的 Release() 操作注册清理任务
-    row_cache.RegisterReleaseAsCleanup(row_handle, value_pinner);
-    // 解析 cache 缓存的序列化结果并放到 get_context 里
-    *read_status = replayGetContextLog(*row_cache.Value(row_handle), user_key,
-                                       get_context, &value_pinner, seq_no);
-    found = true;
-  } 
-  return found;
-}
 
+```
 
+**读取 SST 文件的读操作详见 [SST 章节](https://github.com/LiuRuoyu01/learn-rocksdb/blob/main/ch02/RocksDB_SST.md#get-%E6%93%8D%E4%BD%9C)**
+
+##### Get TableReader 操作
+
+```c++
 // ReadOptions                        : 本次读取的策略
 // file_options                       : SST 文件的 I/O 行为
 // internal_comparator                : internal_key 的比较逻辑
@@ -770,7 +787,7 @@ Status TableCache::FindTable(
       return Status::OK();
     }
 
-    // 调用 GetTableReader 加载 SST 文件
+    // 获取 TableReader，需要利用 TableReader 加载 SST 文件
     std::unique_ptr<TableReader> table_reader;
     Status s = GetTableReader(ro, file_options, internal_comparator, file_meta,
                               false /* sequential mode */, file_read_hist,
