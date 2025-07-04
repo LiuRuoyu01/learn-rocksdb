@@ -302,4 +302,185 @@ Flag:
 
 
 
-SST 文件的 Get 操作请在 [version](../ch03/RocksDB_Version.md) 中查看
+##### Get 操作
+
+```c++
+Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
+                            GetContext* get_context,
+                            const SliceTransform* prefix_extractor,
+                            bool skip_filters) {
+  // 时间戳过滤
+  if (!TimestampMayMatch(read_options)) {
+    return Status::OK();
+  }
+  
+  Status s;
+
+  // 初始化 bloom filter
+  FilterBlockReader* const filter =
+      !skip_filters ? rep_->filter.get() : nullptr;
+
+  // First check the full filter
+  // If full filter not useful, Then go into each block
+  uint64_t tracing_get_id = get_context->get_tracing_get_id();
+  BlockCacheLookupContext lookup_context{
+      TableReaderCaller::kUserGet, tracing_get_id,
+      /*get_from_user_specified_snapshot=*/read_options.snapshot != nullptr};
+  if (block_cache_tracer_ && block_cache_tracer_->is_tracing_enabled()) {
+    // Trace the key since it contains both user key and sequence number.
+    lookup_context.referenced_key = key.ToString();
+    lookup_context.get_from_user_specified_snapshot =
+        read_options.snapshot != nullptr;
+  }
+  // 通过 bllom filter 判断键是否可能存在 
+  const bool may_match =
+      FullFilterKeyMayMatch(filter, key, prefix_extractor, get_context,
+                            &lookup_context, read_options);
+
+  if (may_match) {
+    IndexBlockIter iiter_on_stack;
+    // if prefix_extractor found in block differs from options, disable
+    // BlockPrefixIndex. Only do this check when index_type is kHashSearch.
+    bool need_upper_bound_check = false;
+    if (rep_->index_type == BlockBasedTableOptions::kHashSearch) {
+      need_upper_bound_check = PrefixExtractorChanged(prefix_extractor);
+    }
+    auto iiter =
+        NewIndexIterator(read_options, need_upper_bound_check, &iiter_on_stack,
+                         get_context, &lookup_context);
+    std::unique_ptr<InternalIteratorBase<IndexValue>> iiter_unique_ptr;
+    if (iiter != &iiter_on_stack) {
+      iiter_unique_ptr.reset(iiter);
+    }
+
+    size_t ts_sz =
+        rep_->internal_comparator.user_comparator()->timestamp_size();
+    bool matched = false;  // if such user key matched a key in SST
+    bool done = false;
+    for (iiter->Seek(key); iiter->Valid() && !done; iiter->Next()) {
+      IndexValue v = iiter->value();
+
+      if (!v.first_internal_key.empty() && !skip_filters &&
+          UserComparatorWrapper(rep_->internal_comparator.user_comparator())
+                  .CompareWithoutTimestamp(
+                      ExtractUserKey(key),
+                      ExtractUserKey(v.first_internal_key)) < 0) {
+        // The requested key falls between highest key in previous block and
+        // lowest key in current block.
+        break;
+      }
+
+      BlockCacheLookupContext lookup_data_block_context{
+          TableReaderCaller::kUserGet, tracing_get_id,
+          /*get_from_user_specified_snapshot=*/read_options.snapshot !=
+              nullptr};
+      bool does_referenced_key_exist = false;
+      DataBlockIter biter;
+      uint64_t referenced_data_size = 0;
+      Status tmp_status;
+      NewDataBlockIterator<DataBlockIter>(
+          read_options, v.handle, &biter, BlockType::kData, get_context,
+          &lookup_data_block_context, /*prefetch_buffer=*/nullptr,
+          /*for_compaction=*/false, /*async_read=*/false, tmp_status,
+          /*use_block_cache_for_lookup=*/true);
+
+      if (read_options.read_tier == kBlockCacheTier &&
+          biter.status().IsIncomplete()) {
+        // couldn't get block from block_cache
+        // Update Saver.state to Found because we are only looking for
+        // whether we can guarantee the key is not there when "no_io" is set
+        get_context->MarkKeyMayExist();
+        s = biter.status();
+        break;
+      }
+      if (!biter.status().ok()) {
+        s = biter.status();
+        break;
+      }
+
+      bool may_exist = biter.SeekForGet(key);
+      // If user-specified timestamp is supported, we cannot end the search
+      // just because hash index lookup indicates the key+ts does not exist.
+      if (!may_exist && ts_sz == 0) {
+        // HashSeek cannot find the key this block and the the iter is not
+        // the end of the block, i.e. cannot be in the following blocks
+        // either. In this case, the seek_key cannot be found, so we break
+        // from the top level for-loop.
+        done = true;
+      } else {
+        // Call the *saver function on each entry/block until it returns false
+        for (; biter.Valid(); biter.Next()) {
+          ParsedInternalKey parsed_key;
+          Status pik_status = ParseInternalKey(
+              biter.key(), &parsed_key, false /* log_err_key */);  // TODO
+          if (!pik_status.ok()) {
+            s = pik_status;
+            break;
+          }
+
+          Status read_status;
+          bool ret = get_context->SaveValue(
+              parsed_key, biter.value(), &matched, &read_status,
+              biter.IsValuePinned() ? &biter : nullptr);
+          if (!read_status.ok()) {
+            s = read_status;
+            break;
+          }
+          if (!ret) {
+            if (get_context->State() == GetContext::GetState::kFound) {
+              does_referenced_key_exist = true;
+              referenced_data_size = biter.key().size() + biter.value().size();
+            }
+            done = true;
+            break;
+          }
+        }
+        if (s.ok()) {
+          s = biter.status();
+        }
+        if (!s.ok()) {
+          break;
+        }
+      }
+      // Write the block cache access record.
+      if (block_cache_tracer_ && block_cache_tracer_->is_tracing_enabled()) {
+        // Avoid making copy of block_key, cf_name, and referenced_key when
+        // constructing the access record.
+        Slice referenced_key;
+        if (does_referenced_key_exist) {
+          referenced_key = biter.key();
+        } else {
+          referenced_key = key;
+        }
+        FinishTraceRecord(lookup_data_block_context,
+                          lookup_data_block_context.block_key, referenced_key,
+                          does_referenced_key_exist, referenced_data_size);
+      }
+
+      if (done) {
+        // Avoid the extra Next which is expensive in two-level indexes
+        break;
+      }
+    }
+    if (matched && filter != nullptr) {
+      if (rep_->whole_key_filtering) {
+        RecordTick(rep_->ioptions.stats, BLOOM_FILTER_FULL_TRUE_POSITIVE);
+      } else {
+        RecordTick(rep_->ioptions.stats, BLOOM_FILTER_PREFIX_TRUE_POSITIVE);
+      }
+      // Includes prefix stats
+      PERF_COUNTER_BY_LEVEL_ADD(bloom_filter_full_true_positive, 1,
+                                rep_->level);
+    }
+
+    if (s.ok() && !iiter->status().IsNotFound()) {
+      s = iiter->status();
+    }
+  }
+
+  return s;
+}
+
+```
+
+详见 [BlockCache](https://github.com/LiuRuoyu01/learn-rocksdb/blob/main/ch03/RocksDB_Cache.md#block-cache) 章节和 [BloomFilter](../ch03/RocksDB_BloomFilter.md) 章节对相关内容的介绍

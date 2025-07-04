@@ -256,7 +256,7 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
 }
 ```
 
-在 [memtable](../ch02/RocksDB_MemTable.md) 和 [version](../ch03/RocksDB_Version.md) 的章节中对具体的 Get 操作有相关介绍
+**在 [memtable](https://github.com/LiuRuoyu01/learn-rocksdb/blob/main/ch02/RocksDB_MemTable.md#get-%E6%93%8D%E4%BD%9C) 和 [version](https://github.com/LiuRuoyu01/learn-rocksdb/blob/main/ch03/RocksDB_Version.md#get-%E6%93%8D%E4%BD%9C) 的章节中对具体的 Get 操作有相关介绍**
 
 
 
