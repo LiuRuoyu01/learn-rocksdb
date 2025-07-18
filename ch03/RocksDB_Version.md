@@ -444,7 +444,7 @@ void FileIndexer::GetNextLevelIndex(const size_t level, const size_t file_index,
 
 
 
-#### SuperVersion
+### SuperVersion
 
 SuperVersion 是管理数据版本一致性的核心机制，包含当前活跃的 **MemTable**、**Immutable MemTables** 以及磁盘上的 **SST 文件版本（Version）**，访问 SuperVersion 的成员变量线程不安全，需要锁机制保障
 
@@ -532,11 +532,11 @@ void ColumnFamilyData::ResetThreadLocalSuperVersions() {
 
 
 
-##### ThreadLocalPtr
+#### ThreadLocalPtr
 
 TLS 全称为 Thread-Local-Storage，也就是线程私有存储。每个线程有一个私有的存储区域，通过 key 来索引。当线程访问 TLS 变量时，实际上是通过 key 获取自己线程内的数据，是允许**多线程程序中的每个线程拥有独立数据副本**的机制，解决了多线程环境下全局变量或静态变量的共享冲突问题。
 
-RocksDB 使用 Version 用于维护当前 DB 的状态信息，SuperVersion 作为 Version 系统的重要模块之一，需要被后台线程（compaction / flush）更新和前台用户线程读取，多线程访问形成了竞态条件，为了降低前台线程的访问延迟，RocksDB 对 SuperVersion 模块使用 TLS，通过乐观锁机制来控制并发，做到读不上锁（读的时候如果感知到共享变量发生变化，再利用共享变量的最新值填充本地缓存），读写无并发冲突，只有写写冲突（需要加锁，通知所有线程局部变量发生变化）。
+RocksDB 使用 Version 用于维护当前 DB 的状态信息，SuperVersion 作为 Version 系统的重要模块之一，需要被后台线程（compaction / flush）更新和前台用户线程读取，多线程访问形成了竞态条件，为了降低前台线程的访问延迟，RocksDB 对 SuperVersion 模块使用 TLS，通过**乐观锁机制**来控制并发，做到读不上锁（读的时候如果感知到共享变量发生变化，再利用共享变量的最新值填充本地缓存），读写无并发冲突，只有写写冲突（需要加锁，通知所有线程局部变量发生变化）。
 
 RocksDB 需要 TLS 满足两个条件
 
@@ -544,11 +544,26 @@ RocksDB 需要 TLS 满足两个条件
 2. **可以被一个线程清空或重置**（全局只定义了一个线程局部变量）
 3. 需要一个全局变量，线程局部变量只是作为全局变量的缓存
 
-应用场景
+##### 应用场景
 
-TLS 作为 cache，仍然需要一个全局变量，全局变量保持最新值，而 TLS 则可能存在滞后，这就要求使用场景不要求读写实时严格一致。全局变量和局部缓存有交互，交互逻辑是，全局变量变化后，局部线程要能及时感知到，但不需要实时。允许读写并发，即允许读的时候，使用旧值读，待下次读的时候，再获取到新值。Rocksdb 中的 superversion 管理则符合这种使用场景，swich / flush / compaction 会产生新的 superversion，读写数据时，则需要读 supversion。往往读写等前台操作相对于 switch / flush / compaction 更频繁，所以读 superversion 比写 superversion 比例更高，而且允许系统中同时存留多个 superversion。
+- TLS 作为 cache，仍然需要一个全局变量，全局变量保持最新值，而 TLS 则可能存在滞后，这就要求使用场景**不要求读写实时严格一致**。
+
+- 全局变量和局部缓存有交互，交互逻辑是，全局变量变化后，局部线程要能及时感知到，但不需要实时。
+
+- 允许读写并发，即允许读的时候，使用旧值读，待下次读的时候，再获取到新值。
+
+Rocksdb 中的 superversion 管理则符合这种使用场景，swich / flush / compaction 会产生新的 superversion，读写数据时，则需要读 supversion。往往读写等前台操作相对于 switch / flush / compaction 更频繁，所以读 superversion 比写 superversion 比例更高，而且允许系统中同时存留多个 superversion。
 
 ```c++
+ ---------------------------------------------------
+ |          | instance 1 | instance 2 | instnace 3 |
+ ---------------------------------------------------
+ | thread 1 |    void*   |    void*   |    void*   | <- ThreadData
+ ---------------------------------------------------
+ | thread 2 |    void*   |    void*   |    void*   | <- ThreadData
+ ---------------------------------------------------
+ | thread 3 |    void*   |    void*   |    void*   | <- ThreadData
+   
 class ThreadLocalPtr {
   ...
   static StaticMeta* Instance();
@@ -567,6 +582,7 @@ __thread ThreadData* ThreadLocalPtr::StaticMeta::tls_ = nullptr;
 ThreadLocalPtr 类就是 RocksDB 提供的 TLS 实现接口，ThreadLocalPtr::StaticMeta 是一个单例对象。该对象的成员 tls_ 是一个 TLS 变量，指向 ThreadData 类型。**所有定义的 ThreadLocalPtr 对象都挂载在了 tls_ 变量上**。
 
 ```c++
+// 获取某个 id 对应的局部缓存内容，通过单例 StaticMeta 对象管理。
 struct ThreadData {
   explicit ThreadData(ThreadLocalPtr::StaticMeta* _inst)
     : entries(),
@@ -584,28 +600,46 @@ struct Entry {
   std::atomic<void*> ptr;
 };
 
-// 读线程通过Swap接口来获取变量内容，写线程则通过Scrape接口
-// 获取某个 id 对应的局部缓存内容，通过单例StaticMeta对象管理。
+// 线程通过 Swap 更新本地缓存的 SuperVersion
 void* ThreadLocalPtr::StaticMeta::Swap(uint32_t id, void* ptr) {
+  // 每个线程获取独立的 tls 结构
   auto* tls = GetThreadLocal();
   if (UNLIKELY(id >= tls->entries.size())) {
-    // Need mutex to protect entries access within ReclaimId
     MutexLock l(Mutex());
     tls->entries.resize(id + 1);
   }
+  // 原子交换，将原指针替换为新指针
   return tls->entries[id].ptr.exchange(ptr, std::memory_order_acquire);
 }
+
+// 调用 Scrape 回收所有线程的旧 SuperVersion，防止内存泄漏
 // 将所有管理的对象指针设置为 nullptr（obsolote），将过期的指针返回，供上层释放
+void ColumnFamilyData::ResetThreadLocalSuperVersions() {
+  // 收集所有线程的本地的 superversion
+  autovector<void*> sv_ptrs;
+  local_sv_->Scrape(&sv_ptrs, SuperVersion::kSVObsolete);
+  for (auto ptr : sv_ptrs) {
+    // 跳过仍在使用的 sv
+    if (ptr == SuperVersion::kSVInUse) {
+      continue;
+    }
+    auto sv = static_cast<SuperVersion*>(ptr);
+    bool was_last_ref __attribute__((__unused__));
+    was_last_ref = sv->Unref();
+  }
+}
+
 // 下次从局部线程栈获取时，发现内容为 nullptr（obsolote），则重新申请对象。
 void ThreadLocalPtr::StaticMeta::Scrape(uint32_t id, autovector<void*>* ptrs,
                                         void* const replacement) {
   MutexLock l(Mutex());
+  // 遍历所有线程的 TLS
   for (ThreadData* t = head_.next; t != &head_; t = t->next) {
     if (id < t->entries.size()) {
       void* ptr =
           t->entries[id].ptr.exchange(replacement, std::memory_order_acquire);
       if (ptr != nullptr) {
-        // 搜集各个线程缓存，进行解引用，必要时释放内存
+        // 搜集各个线程缓存，后续统一释放内存
         ptrs->push_back(ptr);
       }
     }

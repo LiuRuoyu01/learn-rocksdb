@@ -61,37 +61,37 @@ LAST == 4       // 用户记录所有内部片段的类型
 
 
 
-#### WAL写入模式
+#### WAL 写入模式
 
 ##### 异步模式
 
-数据写入不会立即写磁盘，只会写入操作系统的页缓存，操作系统因某些原因（如脏页过多）触发刷新，数据才会写入磁盘，用户无需等待I/O，写入操作延迟低，此模式不具备崩溃安全
+- 数据写入不会立即写磁盘，只会写入操作系统的页缓存，操作系统因某些原因（如脏页过多）触发刷新，数据才会写入磁盘，用户无需等待I/O，写入操作延迟低，此模式不具备崩溃安全
 
-优化：Options.manual_wal_flush = true，WAL直接保存在RocksDB得内部缓冲区，调用 DB::FlushWAL() 手动将缓冲的 WAL 条目写入文件系统，进一步减少写入 OS 页缓存的 CPU 开销，此模式同样不具备崩溃安全
+- 优化：Options.manual_wal_flush = true，WAL直接保存在RocksDB得内部缓冲区，调用 DB::FlushWAL() 手动将缓冲的 WAL 条目写入文件系统，进一步减少写入 OS 页缓存的 CPU 开销，此模式同样不具备崩溃安全
 
 ##### 同步模式
 
-每次写入操作返回前，都会对 WAL 文件执行 fsync，确保数据持久化到磁盘，提供崩溃安全性。
+- 每次写入操作返回前，都会对 WAL 文件执行 fsync，确保数据持久化到磁盘，提供崩溃安全性。写入延迟会显著增加，需要等待 I/O 完成。
 
-写入延迟会显著增加，需要等待 I/O 完成。
+##### group commit
 
-###### 组提交
+- 当多个线程同时向同一个 DB 写入时，RocksDB 会将符合条件的写入请求合并为一个 batch 进行 WAL 写入，并执行一次 fsync。不同的写选项可能导致请求无法合并（例如同步与异步写入混合时），group commit 的最大为 1MB。
 
-当多个线程同时向同一个 DB 写入时，RocksDB 会将符合条件的写入请求合并为一个批次（batch）进行 WAL 写入，并执行一次 fsync。
+##### Recycle
 
-不同的写选项可能导致请求无法合并（例如同步与异步写入混合时），组提交的最大大小为 1MB。RocksDB 也不会通过主动延迟写入来增加批量大小
+1. 默认情况下（**Options.recycle_log_file_num = false**），每次创建新的 WAL 文件，调用 fsync 会修改文件的数据和大小，因此需要至少两次 I/O（数据和元数据），虽然 RocksDB 使用 fallocate() 预分配文件空间，但这无法完全避免元数据 I/O
 
-###### I/O数量
-
-1. 默认情况下（**Options.recycle_log_file_num = false**），每个新的 WAL 段都会创建一个新文件，每次 fsync 会修改文件的数据和大小，因此需要至少两次 I/O（数据和元数据），RocksDB 使用 fallocate() 预分配文件空间，但这无法完全避免元数据 I/O
-
-2. 启用WAL文件重用（**Options.recycle_log_file_num = true**），WAL 文件不会被删除，而是被重用，从文件的开始位置随机写入，直接覆盖旧数据。文件大小不会改变，因此可以避免元数据 I/O，如果WAL 文件大小相似，元数据 I/O 开销将被最小化
+2. 启用 WAL 文件 recycle 模式（**Options.recycle_log_file_num = true**），WAL 文件不会被删除，而是被 recycle，从文件的开始位置随机写入，直接覆盖旧数据，初始阶段文件大小不变，直到写入量超过原文件大小。若写入未超过原文件大小，仅需要更新数据信息，因此可以避免元数据 I/O。如果WAL 文件大小相似，元数据 I/O 开销将被最小化
 
 ###### 写放大
 
-当写入数据量较小时，文件系统也需要更新整个页，以确保数据完整性，这意味着小数据量占用了整页的空间
+- 当写入数据量较小时，文件系统也需要更新整个页，以确保数据完整性，这意味着小数据量占用了整页的空间
 
-文件系统还需要更新元数据信息，这些元数据信息也需要写会磁盘，也需要占用整页的空间
+- 文件系统还需要更新元数据信息，这些元数据信息也需要写会磁盘，也需要占用整页的空间
+
+
+
+#### 写入 WAL
 
 ```c++
 // 单线程写入 WAL
@@ -230,7 +230,6 @@ IOStatus DBImpl::ConcurrentWriteToWAL(
 }
 
 
-
 IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
                             const WriteOptions& write_options,
                             log::Writer* log_writer, uint64_t* log_used,
@@ -263,4 +262,71 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
   // ...
 }
 ```
+
+
+
+#### 删除 WAL
+
+在 [MANIFEST:ProcessManifestWrites](https://github.com/LiuRuoyu01/learn-rocksdb/blob/main/ch02/RocksDB_Manifest.md#ProcessManifestWrites) 章节中，更新 MANIFEST 的同时会[更新 min_log_number](https://github.com/LiuRuoyu01/learn-rocksdb/blob/main/ch02/RocksDB_Manifest.md#manifest-%E8%B7%9F%E8%B8%AAwal-%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F)，`FindObsoleteFiles` 会根据此信息取判断 WAL 生命周期是否结束，从而删除 WAL 文件
+
+```c++
+void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
+                               bool no_full_scan) {
+  // ...
+  job_context->log_number = versions_->min_log_number_to_keep();
+  // ...
+  log_write_mutex_.Lock();
+
+  if (alive_log_files_.empty() || logs_.empty()) {
+    log_write_mutex_.Unlock();
+    return;
+  }
+
+  if (!alive_log_files_.empty() && !logs_.empty()) {
+    // logfile_num <= min_log_number 都应该删除
+    uint64_t min_log_number = job_context->log_number;
+    size_t num_alive_log_files = alive_log_files_.size();
+
+    // 1. 检测新的 obsoleted WAL files，即生命周期已结束的
+    while (alive_log_files_.begin()->number < min_log_number) {
+      auto& earliest = *alive_log_files_.begin();
+
+      // 是否回收，不收回则加入待删除队列
+      if (immutable_db_options_.recycle_log_file_num > log_recycle_files_.size()) {
+        log_recycle_files_.push_back(earliest.number);
+      } else {
+        job_context->log_delete_files.push_back(earliest.number);
+      }
+      alive_log_files_.pop_front();
+    }
+    log_write_mutex_.Unlock();
+    mutex_.Unlock();
+
+    // 2. 检测待释的 LogWriter
+    log_write_mutex_.Lock();
+    while (!logs_.empty() && logs_.front().number < min_log_number) {
+      auto& log = logs_.front();
+      if (log.IsSyncing()) {
+        log_sync_cv_.Wait();
+        continue;
+      }
+      logs_to_free_.push_back(log.ReleaseWriter());
+      logs_.pop_front();
+    }
+  }
+
+  job_context->logs_to_free = logs_to_free_;
+  logs_to_free_.clear();
+  log_write_mutex_.Unlock();
+
+  // 3. 回收
+  mutex_.Lock();
+  job_context->log_recycle_files.assign(log_recycle_files_.begin(),
+                                        log_recycle_files_.end());
+}
+```
+
+
+
+
 
