@@ -1,22 +1,16 @@
 
 
-## MemTable文件
+## MemTable 文件
 
-RocksDB的写请求写入到MemTable后就认为是写成功了，MemTable存放在内存中的，他保存了__落盘到SST文件前的数据__。同时服务于读和写，新的写入总是将数据插入到MemTable。一旦一个MemTable被写满（或者满足一定条件），他会变成不可修改的MemTable，即ImMemTable，并被一个新的MemTable替换。一个后台线程会将ImMemTable的内容落盘到一个SST文件，然后ImMemTable就可以被销毁了。
+RocksDB 的写请求写入到 MemTable 后就认为是写成功了，MemTable 存放在内存中的，他保存了__落盘到 SST 文件前的数据__。同时服务于读和写，新的写入总是将数据插入到 MemTable。一旦一个 MemTable 被写满（或者满足一定条件），他会变成不可修改的 MemTable，即 ImMemTable，并被一个新的 MemTable 替换。[后台线程会将 ImMemTable 的内容落盘到一个 SST 文件](https://github.com/LiuRuoyu01/learn-rocksdb/blob/main/ch04/RocksDB_Flush.md)，然后 ImMemTable 就可以被销毁了。
 
-单个memtable的key分布是有序的，最常用的是基于SkipList（跳表）实现，有较好的读写性能，支持**并发写入**和**Hint插入**
-
-<img src="./images/memtable.png" alt="memtable" style="zoom:200%;" />
+单个 memtable 的 key 分布是有序的，最常用的是基于 SkipList（跳表）实现，有较好的读写性能，支持**并发写入**和 **Hint 插入**
 
 除了默认的 memtable 实现，用户还可以使用其他类型的 memtable 实现，例如 HashLinkList（将数据组织在哈希表中，每个哈希桶都是一个排序的单链表）、HashSkipList（将数据组织在哈希表中，每个哈希桶都是一个跳表），来加速某些查询。
 
-#### Flush
 
-1. 单个 MemTable 超出大小范围，会触发刷盘
-2. 所有 Column Family 的 MemTable 总大小超过限额
-3. WAL 文件的总大小超过限额，则会刷存储最旧数据的 MemTable，以便删除该 WAL 文件
 
-memtable 可以在其满之前被刷新，后续章节会对flush进行详细的讲解
+### Memtable
 
 ```c++
 // 存入MemTable的kv数据格式
@@ -80,7 +74,9 @@ class MemTable final : public ReadOnlyMemTable {
 };
 ```
 
-#### Add 操作
+
+
+#### MemTable::Add
 
 ```c++
 Status MemTable::Add(SequenceNumber s, ValueType type, const Slice& key, /* user key */  
@@ -122,7 +118,6 @@ Status MemTable::Add(SequenceNumber s, ValueType type, const Slice& key, /* user
   // 是否开启并发写入，allow_concurrent 默认为 false 
   if (!allow_concurrent) {    
     // 带 hint 插入，通过 map 记录一些前缀插入 skiplist 的位置，从而再次插入相同前缀的 key 时快速找到位置    
-    // 默认不启用   
     if (insert_with_hint_prefix_extractor_ != nullptr && 
         insert_with_hint_prefix_extractor_->InDomain(key_slice)) {      
       Slice prefix = insert_with_hint_prefix_extractor_->Transform(key_slice);  
@@ -228,7 +223,9 @@ Status MemTable::Add(SequenceNumber s, ValueType type, const Slice& key, /* user
 
 ```
 
-#### Get 操作
+
+
+#### MemTable::Get
 
 ```c++
 bool MemTable::Get(const LookupKey& key, std::string* value,
@@ -243,13 +240,13 @@ bool MemTable::Get(const LookupKey& key, std::string* value,
     return false;
   }
 
-  // 初始化一个迭代器，用于遍历范围删除的记录，检查 key 是否被范围删除覆盖
+  // 1. 初始化一个迭代器，用于遍历范围删除的记录，检查 key 是否被范围删除覆盖
   std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
       NewRangeTombstoneIterator(read_opts,
                                 GetInternalKeySeqno(key.internal_key()),
                                 immutable_memtable));
   if (range_del_iter != nullptr) {
-    // 当前 memtable 中存在范围删除的操作，需要检查是否含有目标 key
+    // 2. 当前 memtable 中存在范围删除的操作，需要检查是否含有目标 key
     // covering_seq 为覆盖目标 Key 的最新范围删除操作的序列号
     SequenceNumber covering_seq =
         range_del_iter->MaxCoveringTombstoneSeqnum(key.user_key());
@@ -268,7 +265,7 @@ bool MemTable::Get(const LookupKey& key, std::string* value,
   bool may_contain = true;
   Slice user_key_without_ts = StripTimestampFromUserKey(key.user_key(), ts_sz_);
   bool bloom_checked = false;
-  //用布隆过滤器判断键是否可能存在 memtable 里面
+  // 3. 用布隆过滤器判断键是否可能存在 memtable 里面
   if (bloom_filter_) {    
     if (moptions_.memtable_whole_key_filtering) {
       // 全键过滤
@@ -288,21 +285,13 @@ bool MemTable::Get(const LookupKey& key, std::string* value,
     // 布隆过滤器未找到标记 key 不存在
     *seq = kMaxSequenceNumber;
   } else {
-    // 执行 memtable 的坚持
+    // 4. 执行 memtable 的 get 操作
     GetFromTable(key, *max_covering_tombstone_seq, do_merge, callback,
                  is_blob_index, value, columns, timestamp, s, merge_context,
                  seq, &found_final_value, &merge_in_progress);
   }
-
-  if (!found_final_value && merge_in_progress) {
-    // 未找到最终值并存在未完成的合并操作，此时应该处于合并的状态中
-    if (s->ok()) {
-      *s = Status::MergeInProgress();
-    } else {
-      assert(s->IsMergeInProgress());
-    }
-  }
-
+  //...
+  
   return found_final_value;
 }
 
@@ -362,7 +351,9 @@ void MemTableRep::Get(const LookupKey& k, void* callback_args,
 }
 ```
 
-##### IMMemtable
+
+
+#### IMMemtable
 
 ```c++
 bool MemTableListVersion::GetFromList(
@@ -402,7 +393,9 @@ bool MemTableListVersion::GetFromList(
 
 
 
-#### Flush 操作
+#### Flush 触发条件
+
+具体的 Flush 操作详见 [Flush 章节](https://github.com/LiuRuoyu01/learn-rocksdb/blob/main/ch04/RocksDB_Flush.md)
 
 ```c++
 bool MemTable::ShouldFlushNow() {
@@ -432,10 +425,13 @@ bool MemTable::ShouldFlushNow() {
   // 如果最后一块内存块的未使用空间小于其总大小的 1/4，返回 true，触发刷盘
   return arena_.AllocatedAndUnused() < kArenaBlockSize / 4;
 }
-
 ```
 
-#### 跳表相关操作
+
+
+### SkipList
+
+<img src="./images/memtable.png" alt="memtable" style="zoom:200%;" />
 
 ```c++
 char* InlineSkipList<Comparator>::AllocateKey(size_t key_size) {  
@@ -458,7 +454,9 @@ InlineSkipList<Comparator>::AllocateNode(size_t key_size, int height) {
 }
 ```
 
-##### Add 操作
+
+
+#### SkipList::Insert
 
 ```c++
 template <class Comparator>
@@ -605,4 +603,3 @@ void InlineSkipList<Comparator>::FindSpliceForLevel(const DecodedKey& key,
   }
 }
 ```
-
