@@ -185,120 +185,7 @@ RocksDB **使用变长编码（Variable-Length Encoding）** 存储 Key，并采
    - 无需读取磁盘即可获取数据块的第一个 Key
    - 延迟数据块读取，仅在查询需要时才加载数据块
 
-### PlainTable
-
-PlainTable 是 RocksDB 提供的一种 SST 文件格式，针对**纯内存存储或超低延迟存储设备**进行了优化，减少了查询延迟。
-
-- 采用内存索引加速查询
-- 不使用 block cache，减少额外的缓存开销
-- 采用 mmap 机制，避免内存拷贝
-
-#### 文件格式
-
-```
-[data row1]
-[data row1]
-[data row1]
-...
-[data rowN]
-[Property Block]
-[Footer]               // 固定大小，存储在文件末尾，starts at file_size-sizeof(Footer)
-
-data row：
-  encoded key
-  length of value: varint32
-  value bytes
-
-Property Block： 
-   data_size：文件数据部分的结束位置。
-   fixed_key_len：如果所有 Key 长度相同，则存储 Key 长度；否则为 0。
-   
-Footer：固定大小，格式与 BlockBasedTable 相同
-```
-
-##### Key 编码方式
-
-1. Plain Encoding
-
-   - 如果 **所有 Key 长度相同**，则 Key 直接存储
-
-     ```
-     [user key] + [internal bytes]
-     ```
-
-   - 如果 **Key 是变长的**，则 Key 需要前缀长度信息
-
-     ```
-     [length of key: varint32] + [user key] + [internal bytes]
-     ```
-
-2. Prefix Encoding
-
-   一种特殊的增量编码，用于避免重复存储相同前缀的 Key
-
-   - 第一条 Key（Full Key，FK）：完整存储整个 Key。
-   - 第二条 Key（Prefix From Previous Key，PF）：存储前缀长度 + 后缀部分（Suffix）。
-   - 第三条及以后（Key Suffix，SF）：仅存储后缀部分。
-
-   ```
-   +----+----+----+----+----+----+----+----+
-   |  Type   |            Size             |
-   +----+----+----+----+----+----+----+----+
-   
-   Type 为前两位表示 Key 的类型
-   Size 为后6位：
-   	如果 Size < 0x3F（即 63 以下），则这个值就是 Key 长度
-   	如果 Size = 0x3F（即全 1，值 63），则后续存储一个 Varint32，表示真正的 Key 长度。
-   ```
-
-Internal Bytes：
-
-```
-[user key] + [type: 1 byte] + [sequence ID: 7 bytes]
-
-type（1 字节）：表示 Key 类型，如 Put、Delete、Merge 等。
-sequence ID（7 字节）：RocksDB 版本控制用的序列号。
-```
-
-如果 sequence ID = 0，可以用 0x80 代替 8 字节，减少 7 字节存储开销
-
-#### 内存索引
-
-- 在 BlockBasedTable 中，先在索引块进行二分查找，定位数据块，读取数据块后，再次执行 **二分查找** 定位具体 Key
-
-- 在 PlainTable 中，内存索引通过**哈希表**直接定位数据块位置，减少索引查找开销，数据块内仅执行一次**二分查找**
-
-##### 哈希桶
-
-内存索引在顶层是一个哈希表，哈希表的存储桶是文件的偏移量或索引（多个前缀被哈希到同一个桶中或一个前缀的键太多）
-
-```
-+--------------+------------------------------------------------------+
-| Flag (1 bit) | Offset to binary search buffer or file (31 bits)     +
-+--------------+------------------------------------------------------+
-Flag:
-0 表示该桶直接指向 SST 文件的偏移量（线性扫描），偏移量指向 SST 文件中数据的起始位置
-1 表示需要从二分查找缓冲区查找，偏移量指向二分查找缓冲区
-```
-
-##### 二分查找缓冲区
-
-```
-+--------------------------------+
-| number_of_records (varint32)   |  // 记录数量 N
-+--------------------------------+
-| record 1 file offset (fixed32) |  // Key 1 在 SST 文件中的偏移量
-+--------------------------------+
-| record 2 file offset (fixed32) |  // Key 2 在 SST 文件中的偏移量
-+--------------------------------+
-| ...                            |
-+--------------------------------+
-| record N file offset (fixed32) |  // Key N 在 SST 文件中的偏移量
-+--------------------------------+
-```
-
-- 二分查找缓冲区存储的是 SST 文件中 Key 的偏移量，按升序排列
-- 在哈希桶发生冲突或 Key 过多时，RocksDB 先在二分查找缓冲区中进行二分查找，然后在 SST 进行线性查找。
+在 BlockBasedTable 中，先在索引块进行二分查找，定位数据块，读取数据块后，再次执行 **二分查找** 定位具体 Key
 
 
 
@@ -442,3 +329,116 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
 ```
 
 **详见 [BlockCache](https://github.com/LiuRuoyu01/learn-rocksdb/blob/main/ch03/RocksDB_Cache.md#block-cache) 章节和 [BloomFilter](../ch03/RocksDB_BloomFilter.md) 章节对相关内容的介绍**
+
+
+
+### PlainTable
+
+PlainTable 是 RocksDB 提供的一种 SST 文件格式，针对**纯内存存储或超低延迟存储设备**进行了优化，减少了查询延迟。
+
+- 采用内存索引加速查询
+- 不使用 block cache，减少额外的缓存开销
+- 采用 mmap 机制，避免内存拷贝
+
+#### 文件格式
+
+```
+[data row1]
+[data row1]
+[data row1]
+...
+[data rowN]
+[Property Block]
+[Footer]               // 固定大小，存储在文件末尾，starts at file_size-sizeof(Footer)
+
+data row：
+  encoded key
+  length of value: varint32
+  value bytes
+
+Property Block： 
+   data_size：文件数据部分的结束位置。
+   fixed_key_len：如果所有 Key 长度相同，则存储 Key 长度；否则为 0。
+   
+Footer：固定大小，格式与 BlockBasedTable 相同
+```
+
+##### Key 编码方式
+
+1. Plain Encoding
+
+   - 如果 **所有 Key 长度相同**，则 Key 直接存储
+
+     ```
+     [user key] + [internal bytes]
+     ```
+
+   - 如果 **Key 是变长的**，则 Key 需要前缀长度信息
+
+     ```
+     [length of key: varint32] + [user key] + [internal bytes]
+     ```
+
+2. Prefix Encoding
+
+   一种特殊的增量编码，用于避免重复存储相同前缀的 Key
+
+   - 第一条 Key（Full Key，FK）：完整存储整个 Key。
+   - 第二条 Key（Prefix From Previous Key，PF）：存储前缀长度 + 后缀部分（Suffix）。
+   - 第三条及以后（Key Suffix，SF）：仅存储后缀部分。
+
+   ```
+   +----+----+----+----+----+----+----+----+
+   |  Type   |            Size             |
+   +----+----+----+----+----+----+----+----+
+   
+   Type 为前两位表示 Key 的类型
+   Size 为后6位：
+   	如果 Size < 0x3F（即 63 以下），则这个值就是 Key 长度
+   	如果 Size = 0x3F（即全 1，值 63），则后续存储一个 Varint32，表示真正的 Key 长度。
+   ```
+
+Internal Bytes：
+
+```
+[user key] + [type: 1 byte] + [sequence ID: 7 bytes]
+
+type（1 字节）：表示 Key 类型，如 Put、Delete、Merge 等。
+sequence ID（7 字节）：RocksDB 版本控制用的序列号。
+```
+
+如果 sequence ID = 0，可以用 0x80 代替 8 字节，减少 7 字节存储开销
+
+##### 哈希桶
+
+内存索引在顶层是一个哈希表，哈希表的存储桶是文件的偏移量或索引（多个前缀被哈希到同一个桶中或一个前缀的键太多）
+
+```
++--------------+------------------------------------------------------+
+| Flag (1 bit) | Offset to binary search buffer or file (31 bits)     +
++--------------+------------------------------------------------------+
+Flag:
+0 表示该桶直接指向 SST 文件的偏移量（线性扫描），偏移量指向 SST 文件中数据的起始位置
+1 表示需要从二分查找缓冲区查找，偏移量指向二分查找缓冲区
+```
+
+##### 二分查找缓冲区
+
+```
++--------------------------------+
+| number_of_records (varint32)   |  // 记录数量 N
++--------------------------------+
+| record 1 file offset (fixed32) |  // Key 1 在 SST 文件中的偏移量
++--------------------------------+
+| record 2 file offset (fixed32) |  // Key 2 在 SST 文件中的偏移量
++--------------------------------+
+| ...                            |
++--------------------------------+
+| record N file offset (fixed32) |  // Key N 在 SST 文件中的偏移量
++--------------------------------+
+```
+
+- 二分查找缓冲区存储的是 SST 文件中 Key 的偏移量，按升序排列
+- 在哈希桶发生冲突或 Key 过多时，RocksDB 先在二分查找缓冲区中进行二分查找，然后在 SST 进行线性查找。
+
+在 PlainTable 中，内存索引通过**哈希表**直接定位数据块位置，减少索引查找开销，数据块内仅执行一次**二分查找**
